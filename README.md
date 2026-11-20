@@ -101,16 +101,22 @@ curl http://127.0.0.1:8787/v1/models -H "Authorization: Bearer sk-..."
 
 Console「统计」页显示：
 
-- 累计请求数、错误数、提示/补全/总 Token
-- 每个启用账号的可用余额、月额度、累计额度与单位（60 秒缓存；WorkBuddy 使用 `billing/meter/get-user-resource`，Qoder 使用 `quota/usage`）
-  - WorkBuddy 可用余额 = 各套餐 `CycleCapacityRemain` 之和（当前周期真实可用）
+- 请求数（小字显示失败数）
+- Token 数（小字显示输出 Token）
+- 缓存命中率（`cached_tokens / prompt_tokens`）
+- 积分（可用 / 总数）
+- 每个启用账号的可用余额、月额度、累计额度与单位（60 秒缓存）
+  - WorkBuddy 可用余额 = 各套餐 `CycleCapacityRemain` 之和
   - WorkBuddy 月额度 = `Status=0` 套餐的 `CapacitySize` 之和
   - WorkBuddy 累计额度 = 所有套餐 `CapacitySize` 之和
-  - `CapacityRemain` 是套餐总量/历史余额，不作为当前可用余额
+  - Qoder 可用余额 = `userQuota` + `addOnQuota` + 可用共享包的 `remaining`
+  - Qoder 月额度 = `userQuota.total`（不含个人资源包/add-on）
+  - Qoder 累计额度 = `userQuota.total + addOnQuota.total + 共享包 cap`（共享包耗尽也计入累计）
   - 不同单位（credits / tokens）不混合求和，单位一致时才显示总额
-- 最近 1000 条请求日志：ID、时间、模型/上游模型、提供商/账号、HTTP 状态、耗时、Token、错误
+- 请求日志默认加载最近 10 条；点击“展开”后每页 50 条，可分页加载
+- 日志字段：时间、状态、模型/上游模型、提供商/账号、耗时、Token、积分、HTTP 状态；内存保留最近 1000 条
 
-日志写入数据目录的 `requests.jsonl`（权限 `600`），仅记录元数据，不保存提示词/回复正文；重启后仍可查看。内存与页面均保留最近 1000 条（未认证请求只进内存，不落盘）。
+日志写入数据目录的 `requests.jsonl`（权限 `600`），仅记录元数据，不保存提示词/回复正文；重启后仍可查看。未认证请求只进内存，不落盘。
 
 ## CLI
 
@@ -184,7 +190,7 @@ client → /v1/chat/completions
 - WorkBuddy 签到固定调用官方 `workbuddy.cn` 接口，仅 OAuth 登录账号可签；`ck_` Key 会显示跳过
 - Qoder 签到依赖官方活动接口；无活动时返回“暂无可签到活动”
 - OAuth 的 refresh token 会保存，但自动续期尚未接入，凭证过期后需重新授权
-- 请求日志仅记录元数据（不含提示词/回复正文），页面展示最近 1000 条
+- 请求日志仅记录元数据（不含提示词/回复正文）；默认 10 条，展开后每页 50 条
 - Qoder 自定义 Base URL 同时用于 OAuth/签到 OpenAPI；一般建议留空
 - 上游非流式请求也不做本地模型参数校验，错误按上游状态码回传
 

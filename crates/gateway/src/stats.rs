@@ -158,6 +158,7 @@ impl StatsStore {
     }
 
     /// Newest first, capped at `limit` (tests/diagnostics).
+    #[cfg(test)]
     pub fn snapshot(&self, limit: usize) -> (Totals, Vec<RequestLog>) {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let logs = inner

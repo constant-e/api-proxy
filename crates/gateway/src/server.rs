@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -18,13 +18,15 @@ use gateway_core::{
     RemoteModel, Store,
 };
 
-use crate::stats::{usage_tokens, RequestLog, StatsStore};
+use crate::stats::{usage_cached_tokens, usage_credits, usage_tokens, RequestLog, StatsStore};
 use serde_json::{json, Value};
 
 #[derive(Clone)]
 pub struct CreditSnapshot {
     pub at: i64,
     pub total: Option<f64>,
+    pub monthly_quota: Option<f64>,
+    pub total_quota: Option<f64>,
     pub unit: Option<String>,
     pub units: Vec<String>,
     pub accounts: Vec<Value>,
@@ -65,6 +67,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/api/admin/overview", get(admin_overview))
         .route("/api/admin/stats", get(admin_stats))
+        .route("/api/admin/logs", get(admin_logs))
         .route("/api/admin/accounts", get(admin_accounts))
         .route(
             "/api/admin/accounts/{id}",
@@ -459,6 +462,8 @@ fn base_log(model: &str, stream: bool) -> RequestLog {
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
+        cached_tokens: 0,
+        credits: None,
         error: None,
     }
 }
@@ -480,6 +485,8 @@ fn finish_chat_log(
         log.prompt_tokens = prompt;
         log.completion_tokens = completion;
         log.total_tokens = total;
+        log.cached_tokens = usage_cached_tokens(usage);
+        log.credits = usage_credits(usage);
     }
     log.error = error;
     state.stats.record(log);
@@ -833,6 +840,8 @@ fn sse_response(
             log.prompt_tokens = prompt;
             log.completion_tokens = completion;
             log.total_tokens = total;
+            log.cached_tokens = usage_cached_tokens(usage);
+            log.credits = usage_credits(usage);
         }
         log.error = stream_error;
         stats.record(log);
@@ -921,7 +930,8 @@ async fn admin_stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             "authentication_error",
         );
     }
-    let (totals, logs) = state.stats.snapshot(crate::stats::MAX_LOGS);
+    let totals = state.stats.totals();
+    let log_total = state.stats.total_logs();
     let now = gateway_core::now_ms();
     let cached = state.credits.lock().await.clone();
     let credits = match cached {
@@ -934,14 +944,48 @@ async fn admin_stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     };
     Json(json!({
         "totals": totals,
-        "logs": logs,
+        "log_total": log_total,
         "credits": {
             "total": credits.total,
+            "monthly_quota": credits.monthly_quota,
+            "total_quota": credits.total_quota,
             "unit": credits.unit,
             "units": credits.units,
             "accounts": credits.accounts,
             "at": credits.at,
         },
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+async fn admin_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<LogQuery>,
+) -> Response {
+    if !authorized(&headers, &state) {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "无效的 API Key",
+            "authentication_error",
+        );
+    }
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(10).clamp(1, 50);
+    let (total, logs) = state.stats.page(page, page_size);
+    let pages = total.div_ceil(page_size).max(1);
+    Json(json!({
+        "logs": logs,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "pages": pages,
     }))
     .into_response()
 }
@@ -996,6 +1040,10 @@ async fn fetch_credits(state: &Arc<AppState>) -> CreditSnapshot {
     });
     let rows: Vec<Value> = join_all(tasks).await;
     let mut total = 0.0;
+    let mut monthly = 0.0;
+    let mut quota = 0.0;
+    let mut monthly_found = false;
+    let mut quota_found = false;
     let mut units = std::collections::BTreeSet::new();
     for row in &rows {
         if let Some(n) = row.get("credits").and_then(Value::as_f64) {
@@ -1003,6 +1051,14 @@ async fn fetch_credits(state: &Arc<AppState>) -> CreditSnapshot {
             if let Some(unit) = row.get("unit").and_then(Value::as_str) {
                 units.insert(unit.to_string());
             }
+        }
+        if let Some(n) = row.get("monthly_quota").and_then(Value::as_f64) {
+            monthly += n;
+            monthly_found = true;
+        }
+        if let Some(n) = row.get("total_quota").and_then(Value::as_f64) {
+            quota += n;
+            quota_found = true;
         }
     }
     let units: Vec<String> = units.into_iter().collect();
@@ -1015,6 +1071,16 @@ async fn fetch_credits(state: &Arc<AppState>) -> CreditSnapshot {
         at: gateway_core::now_ms(),
         total: if units.len() <= 1 && !units.is_empty() {
             Some(total)
+        } else {
+            None
+        },
+        monthly_quota: if units.len() <= 1 && monthly_found {
+            Some(monthly)
+        } else {
+            None
+        },
+        total_quota: if units.len() <= 1 && quota_found {
+            Some(quota)
         } else {
             None
         },

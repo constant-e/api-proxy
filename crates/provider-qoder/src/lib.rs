@@ -1208,26 +1208,45 @@ fn qnum(value: &Value) -> Option<f64> {
 
 fn parse_qoder_balance(value: &Value) -> Result<Option<Balance>, String> {
     let root = value.get("data").unwrap_or(value);
-    let mut total = 0.0;
-    let mut quota_total = 0.0;
+    let mut available = 0.0;
+    let mut monthly = 0.0;
+    let mut addon_total = 0.0;
+    let mut shared_total = 0.0;
+    let mut monthly_found = false;
     let mut found = false;
     let mut units = std::collections::BTreeSet::new();
-    for key in ["userQuota", "addOnQuota"] {
-        if let Some(q) = root.get(key) {
-            if let Some(n) = q.get("remaining").and_then(qnum) {
-                total += n;
-                found = true;
-            }
-            if let Some(n) = q.get("total").and_then(qnum) {
-                quota_total += n;
-            }
-            if let Some(unit) = q
-                .get("unit")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                units.insert(unit.to_string());
-            }
+
+    if let Some(q) = root.get("userQuota") {
+        if let Some(n) = q.get("remaining").and_then(qnum) {
+            available += n;
+            found = true;
+        }
+        if let Some(n) = q.get("total").and_then(qnum) {
+            monthly += n;
+            monthly_found = true;
+        }
+        if let Some(unit) = q
+            .get("unit")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            units.insert(unit.to_string());
+        }
+    }
+    if let Some(q) = root.get("addOnQuota") {
+        if let Some(n) = q.get("remaining").and_then(qnum) {
+            available += n;
+            found = true;
+        }
+        if let Some(n) = q.get("total").and_then(qnum) {
+            addon_total += n;
+        }
+        if let Some(unit) = q
+            .get("unit")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            units.insert(unit.to_string());
         }
     }
     for key in [
@@ -1237,12 +1256,21 @@ fn parse_qoder_balance(value: &Value) -> Result<Option<Balance>, String> {
         "poolQuota",
     ] {
         if let Some(q) = root.get(key) {
-            if q.get("available").and_then(Value::as_bool) == Some(false) {
-                continue;
+            let cap = q.get("cap").or_else(|| q.get("total")).and_then(qnum);
+            // cap=-1 is the upstream "unlimited" sentinel; its remaining value
+            // is a placeholder and must not be treated as real balance.
+            let unlimited = cap.map(|n| n < 0.0).unwrap_or(false);
+            let usable = q.get("available").and_then(Value::as_bool) != Some(false) && !unlimited;
+            if usable {
+                if let Some(n) = q.get("remaining").and_then(qnum) {
+                    available += n;
+                    found = true;
+                }
             }
-            if let Some(n) = q.get("remaining").and_then(qnum) {
-                total += n;
-                found = true;
+            // The shared package cap belongs to the cumulative quota even when
+            // the package is exhausted (available=false, remaining=0).
+            if let Some(cap) = cap.filter(|n| *n > 0.0) {
+                shared_total += cap;
             }
             if let Some(unit) = q
                 .get("unit")
@@ -1255,7 +1283,7 @@ fn parse_qoder_balance(value: &Value) -> Result<Option<Balance>, String> {
     }
     if !found {
         if let Some(n) = root.get("remaining").and_then(qnum) {
-            total += n;
+            available += n;
             found = true;
         }
     }
@@ -1268,16 +1296,15 @@ fn parse_qoder_balance(value: &Value) -> Result<Option<Balance>, String> {
             units.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    let total_quota = monthly + addon_total + shared_total;
     Ok(Some(Balance {
-        amount: total,
+        amount: available,
         unit: units.into_iter().next().unwrap_or_else(|| "credits".into()),
-        monthly_quota: if quota_total > 0.0 {
-            Some(quota_total)
-        } else {
-            None
-        },
-        total_quota: if quota_total > 0.0 {
-            Some(quota_total)
+        // Monthly plan quota excludes purchased add-on packages. Shared/org
+        // package balance is part of the cumulative total, not the monthly cap.
+        monthly_quota: if monthly_found { Some(monthly) } else { None },
+        total_quota: if total_quota > 0.0 {
+            Some(total_quota)
         } else {
             None
         },
@@ -1556,12 +1583,32 @@ mod tests {
 
     #[test]
     fn parses_quota_usage_credits() {
-        let v = json!({"userQuota":{"remaining":120,"total":200,"unit":"credits"},"addOnQuota":{"remaining":30,"unit":"credits"},"orgResourcePackage":{"remaining":50}});
+        // Personal: add-on packages must not inflate the monthly plan quota.
+        let v = json!({"userQuota":{"remaining":0,"total":300,"unit":"credits"},"addOnQuota":{"remaining":0,"total":200,"unit":"credits"}});
         let b = parse_qoder_balance(&v).unwrap().unwrap();
-        assert_eq!(b.amount, 200.0);
+        assert_eq!(b.amount, 0.0);
+        assert_eq!(b.monthly_quota, Some(300.0));
+        assert_eq!(b.total_quota, Some(500.0));
         assert_eq!(b.unit, "credits");
-        let v = json!({"data":{"userQuota":{"remaining":7,"unit":"credits"}}});
-        assert_eq!(parse_qoder_balance(&v).unwrap().unwrap().amount, 7.0);
+
+        // Enterprise: shared package cap belongs to the cumulative total.
+        let v = json!({"userQuota":{"remaining":0,"total":300,"unit":"credits"},"addOnQuota":{"remaining":0,"total":200,"unit":"credits"},"orgResourcePackage":{"remaining":1000,"cap":2000,"available":true}});
+        let b = parse_qoder_balance(&v).unwrap().unwrap();
+        assert_eq!(b.amount, 1000.0);
+        assert_eq!(b.monthly_quota, Some(300.0));
+        assert_eq!(b.total_quota, Some(2500.0));
+
+        let v = json!({"userQuota":{"remaining":0,"total":3000,"unit":"credits"},"orgResourcePackage":{"remaining":0,"cap":11000,"available":false}});
+        let b = parse_qoder_balance(&v).unwrap().unwrap();
+        assert_eq!(b.amount, 0.0);
+        assert_eq!(b.monthly_quota, Some(3000.0));
+        assert_eq!(b.total_quota, Some(14000.0));
+
+        let v = json!({"userQuota":{"remaining":0,"total":300,"unit":"credits"},"orgResourcePackage":{"remaining":999,"cap":-1,"available":true}});
+        let b = parse_qoder_balance(&v).unwrap().unwrap();
+        assert_eq!(b.amount, 0.0);
+        assert_eq!(b.total_quota, Some(300.0));
+
         assert!(parse_qoder_balance(&json!({"foo":1})).unwrap().is_none());
     }
 

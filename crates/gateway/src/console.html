@@ -101,6 +101,17 @@
   .stat { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
   .stat .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .stat .l { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .stat .s { color: var(--muted); font-size: 11px; margin-top: 3px; }
+  .vendor-group { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+  .vendor-group > summary {
+    cursor: pointer; padding: 10px 12px; font-weight: 600; list-style: none;
+    display: flex; align-items: center; gap: 8px; background: var(--bg);
+  }
+  .vendor-group > summary::-webkit-details-marker { display: none; }
+  .vendor-group > summary::before { content: "▸"; color: var(--muted); width: 12px; }
+  .vendor-group[open] > summary::before { content: "▾"; }
+  .vendor-group > summary .muted { font-weight: 400; font-size: 12px; }
+  .vendor-group .table-wrap { padding: 0 4px 4px; }
   .table-wrap { overflow-x: auto; }
   .log-error { max-width: 280px; font-size: 11px; color: var(--err); word-break: break-all; }
   .login { max-width: 420px; margin: 90px auto; }
@@ -209,7 +220,16 @@
       <div class="hint" id="credits-meta"></div>
     </div>
     <div class="card">
-      <h2>请求日志（最近 1000 条）</h2>
+      <div class="actions" style="justify-content:space-between;align-items:center;margin-bottom:10px">
+        <h2 style="margin:0">请求日志</h2>
+        <div class="actions">
+          <button class="btn secondary small" id="logs-expand">展开至每页 50 条</button>
+          <button class="btn secondary small" id="logs-prev">上一页</button>
+          <span class="muted" id="logs-page"></span>
+          <button class="btn secondary small" id="logs-next">下一页</button>
+        </div>
+      </div>
+      <div class="hint" id="logs-meta" style="margin-bottom:8px"></div>
       <div id="logs-table"></div>
     </div>
   </section>
@@ -256,6 +276,9 @@ const state = {
   settings: {},
   overview: {},
   stats: null,
+  logs: null,
+  logPage: 1,
+  logPageSize: 10,
 };
 
 function esc(value) {
@@ -379,25 +402,56 @@ function statusText(status) {
   return ({ active: "正常", cooldown: "冷却中", disabled: "已停用" })[status] || status;
 }
 
+function vendorOf(m) {
+  const text = `${m.id || ""} ${(m.upstream_ids || []).join(" ")} ${m.name || ""}`.toLowerCase();
+  if (text.includes("deepseek")) return "DeepSeek";
+  if (text.includes("glm") || text.includes("zhipu")) return "智谱 GLM";
+  if (text.includes("kimi") || text.includes("moonshot")) return "Moonshot Kimi";
+  if (text.includes("minimax")) return "MiniMax";
+  if (text.includes("qwen") || text.includes("tongyi")) return "通义千问";
+  if (text.includes("hy4") || text.includes("hy3") || text.includes("hunyuan") || text.includes("混元")) return "腾讯混元";
+  if (text.includes("step")) return "阶跃星辰 Step";
+  if (text.includes("mimo") || text.includes("xiaomi")) return "小米 MiMo";
+  if (text.includes("space-bunny") || text.includes("space bunny")) return "Space-Bunny";
+  return "其他";
+}
+
 function renderModels() {
   const el = $("#models-table");
   if (!state.models.length) {
     el.innerHTML = '<div class="empty">暂无模型。请先通过授权登录添加账号。</div>';
   } else {
-    const rows = state.models.map((m) => {
-      const providers = (m.providers || [m.provider]).join(" + ");
-      const upstreams = (m.upstream_ids || [m.upstream_id]).join(", ");
-      return `
-      <tr>
-        <td class="mono">${esc(m.id)} ${m.merged ? '<span class="badge active">合并</span>' : ""}</td>
-        <td>${esc(providers)}</td>
-        <td class="mono hide-sm">${esc(upstreams)}</td>
-        <td class="hide-sm">${m.reasoning ? '<span class="badge">推理</span>' : ""} ${m.vision ? '<span class="badge">视觉</span>' : ""}</td>
-      </tr>`;
+    const groups = new Map();
+    for (const m of state.models) {
+      const vendor = vendorOf(m);
+      if (!groups.has(vendor)) groups.set(vendor, []);
+      groups.get(vendor).push(m);
+    }
+    const preferred = ["DeepSeek", "智谱 GLM", "Moonshot Kimi", "MiniMax", "通义千问", "腾讯混元", "阶跃星辰 Step", "小米 MiMo", "Space-Bunny", "其他"];
+    const vendors = [...groups.keys()].sort((a, b) => {
+      const ai = preferred.indexOf(a), bi = preferred.indexOf(b);
+      return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi) || a.localeCompare(b);
+    });
+    el.innerHTML = vendors.map((vendor) => {
+      const models = groups.get(vendor);
+      const rows = models.map((m) => {
+        const providers = (m.providers || [m.provider]).join(" + ");
+        const upstreams = (m.upstream_ids || [m.upstream_id]).join(", ");
+        return `
+          <tr>
+            <td class="mono">${esc(m.id)} ${m.merged ? '<span class="badge active">合并</span>' : ""}</td>
+            <td>${esc(providers)}</td>
+            <td class="mono hide-sm">${esc(upstreams)}</td>
+            <td class="hide-sm">${m.reasoning ? '<span class="badge">推理</span>' : ""} ${m.vision ? '<span class="badge">视觉</span>' : ""}</td>
+          </tr>`;
+      }).join("");
+      return `<details class="vendor-group">
+        <summary>${esc(vendor)} <span class="muted">${models.length} 个模型</span></summary>
+        <div class="table-wrap"><table>
+          <thead><tr><th>模型 ID</th><th>提供商</th><th class="hide-sm">上游 ID</th><th class="hide-sm">能力</th></tr></thead>
+          <tbody>${rows}</tbody></table></div>
+      </details>`;
     }).join("");
-    el.innerHTML = `<table>
-      <thead><tr><th>模型 ID</th><th>提供商</th><th class="hide-sm">上游 ID</th><th class="hide-sm">能力</th></tr></thead>
-      <tbody>${rows}</tbody></table>`;
   }
   const meta = state.modelsMeta || {};
   $("#models-meta").textContent = meta.refreshed_at
@@ -441,8 +495,21 @@ async function loadStats() {
   try {
     state.stats = await api("/api/admin/stats");
     renderStats();
+    state.logPage = 1;
+    await loadLogs(state.logPage);
   } catch (e) {
     $("#stats-cards").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    toast(e.message, true);
+  }
+}
+
+async function loadLogs(page) {
+  try {
+    state.logs = await api(`/api/admin/logs?page=${page}&page_size=${state.logPageSize}`);
+    state.logPage = state.logs.page || page;
+    renderLogs();
+  } catch (e) {
+    $("#logs-table").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
     toast(e.message, true);
   }
 }
@@ -450,58 +517,76 @@ async function loadStats() {
 function renderStats() {
   const s = state.stats || {};
   const t = s.totals || {};
+  const c = s.credits || {};
+  const unit = c.unit || "";
+  const creditsValue = c.total != null
+    ? `${fmtNum(c.total)} ${unit}`.trim()
+    : ((c.units || []).length > 1 ? "多单位" : "-");
+  const creditsSub = c.total_quota != null
+    ? `总数 ${fmtNum(c.total_quota)} ${unit}`.trim()
+    : "总数 -";
+  const hit = t.prompt_tokens > 0
+    ? `${((t.cached_tokens || 0) / t.prompt_tokens * 100).toFixed(1)}%`
+    : "-";
   const cards = [
-    ["请求数", fmtNum(t.requests)],
-    ["错误数", fmtNum(t.errors)],
-    ["总 Tokens", fmtNum(t.total_tokens)],
-    ["提示 Tokens", fmtNum(t.prompt_tokens)],
-    ["补全 Tokens", fmtNum(t.completion_tokens)],
-    ["可用积分", s.credits && s.credits.total != null
-      ? `${fmtNum(s.credits.total)} ${s.credits.unit || ""}`.trim()
-      : (s.credits && (s.credits.units || []).length > 1 ? "多单位" : "-")],
+    { value: fmtNum(t.requests), label: "请求数", sub: `失败 ${fmtNum(t.errors)}` },
+    { value: fmtNum(t.total_tokens), label: "Token 数", sub: `输出 ${fmtNum(t.completion_tokens)}` },
+    { value: hit, label: "缓存命中率", sub: `${fmtNum(t.cached_tokens)} / ${fmtNum(t.prompt_tokens)}` },
+    { value: creditsValue, label: "积分（可用 / 总数）", sub: creditsSub },
   ];
   $("#stats-cards").innerHTML = cards
-    .map(([label, value]) => `<div class="stat"><div class="n">${esc(value)}</div><div class="l">${esc(label)}</div></div>`)
+    .map(({ value, label, sub }) => `<div class="stat"><div class="n">${esc(value)}</div><div class="l">${esc(label)}</div><div class="s">${esc(sub)}</div></div>`)
     .join("");
 
-  const credits = (s.credits && s.credits.accounts) || [];
+  const credits = c.accounts || [];
   if (!credits.length) {
     $("#credits-table").innerHTML = '<div class="empty">暂无账号或额度接口不可用</div>';
   } else {
-    const rows = credits.map((c) => `
+    const rows = credits.map((a) => `
       <tr>
-        <td>${esc(c.provider)}</td>
-        <td>${esc(c.name)}</td>
-        <td class="mono">${c.credits == null ? "-" : esc(`${fmtNum(c.credits)} ${c.unit || ""}`.trim())}
-          ${c.monthly_quota != null || c.total_quota != null ? `<div class="muted" style="font-size:11px">月 ${c.monthly_quota == null ? "-" : esc(fmtNum(c.monthly_quota))} · 累计 ${c.total_quota == null ? "-" : esc(fmtNum(c.total_quota))}</div>` : ""}</td>
-        <td class="hide-sm">${c.error ? `<span class="log-error">${esc(c.error)}</span>` : '<span class="muted">-</span>'}</td>
+        <td>${esc(a.provider)}</td>
+        <td>${esc(a.name)}</td>
+        <td class="mono">${a.credits == null ? "-" : esc(`${fmtNum(a.credits)} ${a.unit || ""}`.trim())}
+          ${a.monthly_quota != null || a.total_quota != null ? `<div class="muted" style="font-size:11px">月 ${a.monthly_quota == null ? "-" : esc(fmtNum(a.monthly_quota))} · 累计 ${a.total_quota == null ? "-" : esc(fmtNum(a.total_quota))}</div>` : ""}</td>
+        <td class="hide-sm">${a.error ? `<span class="log-error">${esc(a.error)}</span>` : '<span class="muted">-</span>'}</td>
       </tr>`).join("");
     $("#credits-table").innerHTML = `<div class="table-wrap"><table>
       <thead><tr><th>提供商</th><th>账号</th><th>可用余额</th><th class="hide-sm">错误</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
   }
-  $("#credits-meta").textContent = s.credits && s.credits.at
-    ? `额度更新于 ${maskTime(s.credits.at)}（60 秒缓存）`
-    : "";
+  $("#credits-meta").textContent = c.at ? `额度更新于 ${maskTime(c.at)}（60 秒缓存）` : "";
+}
 
-  const logs = s.logs || [];
+function renderLogs() {
+  const data = state.logs || {};
+  const logs = data.logs || [];
+  const total = data.total || 0;
+  const pages = data.pages || 1;
+  const page = data.page || 1;
+  $("#logs-meta").textContent = `共 ${fmtNum(total)} 条 · 第 ${page}/${pages} 页 · 每页 ${data.page_size || state.logPageSize} 条`;
+  $("#logs-page").textContent = `${page} / ${pages}`;
+  $("#logs-prev").disabled = page <= 1;
+  $("#logs-next").disabled = page >= pages;
+  $("#logs-expand").hidden = state.logPageSize >= 50 || total <= 10;
+
   if (!logs.length) {
     $("#logs-table").innerHTML = '<div class="empty">暂无请求日志</div>';
     return;
   }
   const rows = logs.map((l) => `
     <tr>
-      <td class="mono hide-sm">#${esc(l.id)}</td>
-      <td class="hide-sm">${esc(maskTime(l.at))}</td>
+      <td class="hide-sm">${esc(maskTime(l.at))}<div class="muted mono">#${esc(l.id)}</div></td>
+      <td><span class="badge ${l.status === "success" ? "active" : "disabled"}">${l.status === "success" ? "成功" : "错误"}</span>
+        <div class="muted mono">HTTP ${esc(l.http_status)}</div>
+        ${l.error ? `<div class="log-error" title="${esc(l.error)}">${esc(String(l.error).slice(0, 80))}</div>` : ""}</td>
       <td class="mono">${esc(l.model)}${l.upstream_model && l.upstream_model !== l.model ? `<div class="muted">${esc(l.upstream_model)}</div>` : ""}</td>
       <td>${esc(l.provider || "-")}<div class="muted">${esc(l.account || "")}</div></td>
-      <td><span class="badge ${l.status === "success" ? "active" : "disabled"}">${l.status === "success" ? "成功" : "错误"}</span><div class="muted mono">HTTP ${esc(l.http_status)}</div></td>
-      <td class="hide-sm mono">${esc(l.duration_ms)} ms</td>
-      <td class="mono hide-sm">${esc(fmtNum(l.total_tokens))}<div class="muted">${esc(fmtNum(l.prompt_tokens))} / ${esc(fmtNum(l.completion_tokens))}</div></td>
-      <td>${l.error ? `<span class="log-error">${esc(l.error)}</span>` : '<span class="muted">-</span>'}</td>
+      <td class="mono hide-sm">${esc(l.duration_ms)} ms</td>
+      <td class="mono">${esc(fmtNum(l.total_tokens))}<div class="muted">${esc(fmtNum(l.prompt_tokens))} / ${esc(fmtNum(l.completion_tokens))}</div></td>
+      <td class="mono">${l.credits == null ? "-" : esc(fmtNum(l.credits))}</td>
     </tr>`).join("");
   $("#logs-table").innerHTML = `<div class="table-wrap"><table>
-    <thead><tr><th class="hide-sm">ID</th><th class="hide-sm">时间</th><th>模型</th><th>提供商 / 账号</th><th>状态</th><th class="hide-sm">耗时</th><th class="hide-sm">Tokens</th><th>错误</th></tr></thead>
+    <thead><tr><th class="hide-sm">时间</th><th>状态</th><th>模型</th><th>账号</th><th class="hide-sm">耗时</th><th>Token</th><th>积分</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
 
@@ -691,6 +776,13 @@ $("#key-input").addEventListener("keydown", (e) => {
 });
 
 $("#stats-refresh").addEventListener("click", () => loadStats());
+$("#logs-expand").addEventListener("click", () => {
+  state.logPageSize = 50;
+  state.logPage = 1;
+  loadLogs(1);
+});
+$("#logs-prev").addEventListener("click", () => loadLogs(Math.max(1, state.logPage - 1)));
+$("#logs-next").addEventListener("click", () => loadLogs(state.logPage + 1));
 
 $("#refresh-models").addEventListener("click", async (e) => {
   e.target.disabled = true;
