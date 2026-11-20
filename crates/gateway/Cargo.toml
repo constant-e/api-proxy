@@ -1,11 +1,11 @@
 [package]
-name = "apiproxy"
+name = "apip"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "apiproxy"
+name = "apip"
 path = "src/main.rs"
 
 [dependencies]
@@ -25,3 +25,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

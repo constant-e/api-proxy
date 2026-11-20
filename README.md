@@ -18,16 +18,25 @@
 
 ```bash
 cargo build --release
-./target/release/apiproxy serve
+./target/release/apip serve
 ```
 
-启动后终端会打印：
+`serve` 默认在后台启动并立即返回终端；Web Console/API 继续在后台运行。`apip`（无子命令）等价于 `apip serve`。启动成功后打印：
 
 ```
 Console : http://127.0.0.1:8787/
 API     : http://127.0.0.1:8787/v1
 API Key : sk-...
 数据目录: ~/.local/share/apiproxy
+日志: ~/.local/share/apiproxy/apip.log
+```
+
+代理服务管理：
+
+```bash
+apip status          # 查看后台网关状态
+apip stop            # 停止后台网关
+apip serve --foreground   # 前台运行（systemd/docker 使用）
 ```
 
 首次启动自动生成 API Key，保存在 `<数据目录>/data.json`（Unix 下权限 `600`）。端口、监听地址、签到时间可在 Console「设置」修改后重启生效；也可用 `--port` 临时覆盖。
@@ -39,8 +48,8 @@ Console「账号 → 授权登录」选择提供商与区域，点「获取授�
 CLI：
 
 ```bash
-apiproxy login --provider workbuddy --region cn
-apiproxy login --provider qoder --region global
+apip login --provider workbuddy --region cn
+apip login --provider qoder --region global
 # --no-open 只打印链接；--name 可指定账号名称
 ```
 
@@ -121,22 +130,26 @@ Console「统计」页显示：
 ## CLI
 
 ```bash
-apiproxy serve [--port 8787]     # 启动服务（默认命令）
-apiproxy key                     # 打印本机 API Key
-apiproxy login --provider qoder --region cn
-apiproxy login --provider workbuddy --region global --no-open
-apiproxy accounts list
-apiproxy accounts remove <id>
-apiproxy accounts enable|disable <id>
-apiproxy accounts test <id>
-apiproxy models [--refresh]
-apiproxy providers
-apiproxy checkin [--account <id>]
-apiproxy settings
-apiproxy chat <model> "你好"
+apip                              # 后台启动（等价 apip serve）
+apip serve [--port 8787]          # 后台启动
+apip serve --foreground           # 前台启动
+apip status                       # 后台状态
+apip stop                         # 停止后台网关
+apip key                          # 打印本机 API Key
+apip login --provider qoder --region cn
+apip login --provider workbuddy --region global --no-open
+apip accounts list
+apip accounts remove <id>
+apip accounts enable|disable <id>
+apip accounts test <id>
+apip models [--refresh]
+apip providers
+apip checkin [--account <id>]
+apip settings
+apip chat <model> "你好"
 ```
 
-CLI 通过 HTTP 调用本机服务；若 `serve --port` 使用了非默认端口，请加 `--server http://127.0.0.1:<port>`，或用全局 `--data-dir` 指向同一数据目录。
+CLI 通过 HTTP 与后台网关通信。`serve --port` 会持久化端口，后续 CLI 自动使用；也可用全局 `--server http://127.0.0.1:<port>` 覆盖地址。
 
 ## 架构
 
@@ -149,7 +162,7 @@ crates/
     openai.rs           OpenAI 响应/SSE 辅助
   provider-workbuddy/   WorkBuddy / CodeBuddy
   provider-qoder/       Qoder（COSY 签名、RSA/AES 会话、自定义 base64）
-  gateway/              apiproxy 单二进制
+  gateway/              apip 单二进制
     server.rs           OpenAI API + 管理 API + 调度器
     console.html        内嵌网页 Console
     main.rs             CLI + 启动

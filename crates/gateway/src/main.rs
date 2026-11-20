@@ -1,4 +1,4 @@
-//! `apiproxy` CLI: one binary for the local server and everyday management.
+//! `apip` CLI: starts the gateway in the background and manages it.
 
 mod server;
 mod stats;
@@ -15,7 +15,7 @@ use server::AppState;
 
 #[derive(Parser)]
 #[command(
-    name = "apiproxy",
+    name = "apip",
     version,
     about = "将国产 AI 平台封装为 OpenAI Completions 协议的本地网关"
 )]
@@ -35,11 +35,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 启动本地网关与网页 Console
+    /// 后台启动本地网关与网页 Console
     Serve {
         #[arg(long)]
         port: Option<u16>,
+        /// 前台运行（供 systemd/docker 使用，会阻塞终端）
+        #[arg(long)]
+        foreground: bool,
     },
+    /// 停止后台网关
+    Stop,
+    /// 查看后台网关状态
+    Status,
     /// 管理上游账号
     Accounts {
         #[command(subcommand)]
@@ -132,8 +139,16 @@ async fn main() -> Result<()> {
     let mut cli = Cli::parse();
     let command = cli.command.take();
     match command {
-        None => serve(cli, None).await,
-        Some(Command::Serve { port }) => serve(cli, port).await,
+        None => start_background(cli, None).await,
+        Some(Command::Serve { port, foreground }) => {
+            if foreground {
+                serve(cli, port).await
+            } else {
+                start_background(cli, port).await
+            }
+        }
+        Some(Command::Stop) => stop(cli).await,
+        Some(Command::Status) => status(cli).await,
         Some(Command::Accounts { cmd }) => accounts(cli, cmd).await,
         Some(Command::Models { refresh }) => models(cli, refresh).await,
         Some(Command::Login {
@@ -166,6 +181,12 @@ fn load_store(cli: &Cli) -> Result<Store> {
 async fn serve(cli: Cli, port_override: Option<u16>) -> Result<()> {
     let dir = data_dir(&cli);
     let mut store = Store::load(&dir, &provider_ids())?;
+    let port_changed = port_override
+        .map(|p| p != store.data.settings.port)
+        .unwrap_or(false);
+    if let Some(port) = port_override {
+        store.data.settings.port = port;
+    }
     let all_providers = providers();
     // Backfill stable identities for accounts created before remote_id
     // existed, so a later browser login updates instead of duplicating.
@@ -183,7 +204,7 @@ async fn serve(cli: Cli, port_override: Option<u16>) -> Result<()> {
     if store.migrate_stale_checkin_errors() {
         changed = true;
     }
-    if changed {
+    if changed || port_changed {
         store.save()?;
     }
     let settings = store.data.settings.clone();
@@ -221,6 +242,13 @@ async fn serve(cli: Cli, port_override: Option<u16>) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("无法监听 {addr}"))?;
+    let pid_path = dir.join("apip.pid");
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
+    }
     let shown_host = if host == "0.0.0.0" || host == "::" {
         "127.0.0.1"
     } else {
@@ -235,11 +263,220 @@ async fn serve(cli: Cli, port_override: Option<u16>) -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    if std::fs::read_to_string(&pid_path)
+        .map(|p| p.trim() == std::process::id().to_string())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&pid_path);
+    }
     Ok(())
 }
 
+fn local_base(settings: &gateway_core::Settings) -> String {
+    let host = if settings.host == "0.0.0.0" || settings.host == "::" {
+        "127.0.0.1"
+    } else {
+        &settings.host
+    };
+    format!("http://{host}:{}", settings.port)
+}
+
+async fn health_ok(base: &str) -> bool {
+    reqwest::Client::new()
+        .get(format!("{base}/health"))
+        .timeout(std::time::Duration::from_millis(800))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+fn tail_log(path: &std::path::Path, lines: usize) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .take(lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn start_background(cli: Cli, port_override: Option<u16>) -> Result<()> {
+    let requested_dir = data_dir(&cli);
+    let mut store = Store::load(&requested_dir, &provider_ids())?;
+    // Store::load creates the directory. Canonicalize before spawning so a
+    // relative --data-dir is not resolved twice (once by the child's
+    // current_dir and again by --data-dir).
+    let dir = std::fs::canonicalize(&requested_dir)
+        .with_context(|| format!("无法解析数据目录 {}", requested_dir.display()))?;
+    if let Some(port) = port_override {
+        if store.data.settings.port != port {
+            store.data.settings.port = port;
+            store.save()?;
+        }
+    }
+    let settings = store.data.settings.clone();
+    let base = local_base(&settings);
+    let key = settings.api_key.clone();
+    if health_ok(&base).await {
+        println!("网关已在运行");
+        println!("  Console : {base}/");
+        println!("  API     : {base}/v1");
+        println!("  API Key : {key}");
+        return Ok(());
+    }
+
+    let log_path = dir.join("apip.log");
+    let _ = std::fs::create_dir_all(&dir);
+    let log = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&log_path)
+            .with_context(|| format!("无法打开日志 {}", log_path.display()))?
+    };
+    let stderr = log.try_clone()?;
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--data-dir")
+        .arg(&dir)
+        .arg("serve")
+        .arg("--foreground")
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(stderr));
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().context("无法启动后台网关")?;
+    let pid = child.id();
+    let pid_path = dir.join("apip.pid");
+    let _ = std::fs::write(&pid_path, pid.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    for _ in 0..75 {
+        if health_ok(&base).await {
+            println!("网关已在后台启动");
+            println!("  Console : {base}/");
+            println!("  API     : {base}/v1");
+            println!("  API Key : {key}");
+            println!("  PID     : {pid}");
+            println!("  日志    : {}", log_path.display());
+            return Ok(());
+        }
+        if let Ok(Some(code)) = child.try_wait() {
+            anyhow::bail!(
+                "后台网关启动失败（退出码 {code}）:\n{}",
+                tail_log(&log_path, 20)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let _ = child.kill();
+    anyhow::bail!("后台网关启动超时:\n{}", tail_log(&log_path, 20));
+}
+
+async fn status(cli: Cli) -> Result<()> {
+    let dir = data_dir(&cli);
+    let store = Store::load(&dir, &provider_ids())?;
+    let base = local_base(&store.data.settings);
+    let pid = std::fs::read_to_string(dir.join("apip.pid"))
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if health_ok(&base).await {
+        println!("状态: 运行中");
+        println!("  Console : {base}/");
+        println!("  API     : {base}/v1");
+        if let Some(pid) = pid {
+            println!("  PID     : {pid}");
+        }
+    } else {
+        println!("状态: 未运行");
+        println!("  地址: {base}");
+    }
+    Ok(())
+}
+
+async fn stop(cli: Cli) -> Result<()> {
+    let dir = data_dir(&cli);
+    let store = Store::load(&dir, &provider_ids())?;
+    let base = local_base(&store.data.settings);
+    let pid_path = dir.join("apip.pid");
+    let pid = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|p| p.trim().parse::<i32>().ok());
+    let Some(pid) = pid else {
+        if health_ok(&base).await {
+            anyhow::bail!(
+                "网关在运行，但没有 PID 文件；请手动停止或使用 --foreground 启动的服务管理器"
+            );
+        }
+        println!("网关未运行");
+        return Ok(());
+    };
+    #[cfg(unix)]
+    unsafe {
+        if libc::kill(pid, libc::SIGTERM) == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(err).context("无法停止后台网关");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("当前平台不支持 apip stop");
+    for _ in 0..50 {
+        if !health_ok(&base).await {
+            let _ = std::fs::remove_file(&pid_path);
+            println!("网关已停止");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("已发送停止信号，但网关仍未退出；请检查 PID {pid}")
+}
+
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                    tracing::info!("shutting down");
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     tracing::info!("shutting down");
 }
 
@@ -281,7 +518,7 @@ async fn api(cli: &Cli, method: reqwest::Method, path: &str, body: Option<Value>
     let resp = req
         .send()
         .await
-        .with_context(|| format!("无法连接 {base}，请先运行 `apiproxy serve`"))?;
+        .with_context(|| format!("无法连接 {base}，请先运行 `apip serve`"))?;
     let status = resp.status();
     let value: Value = resp.json().await.unwrap_or(Value::Null);
     let error_message = value
@@ -305,7 +542,7 @@ async fn accounts(cli: Cli, cmd: AccountsCmd) -> Result<()> {
             let value = api(&cli, reqwest::Method::GET, "/api/admin/accounts", None).await?;
             let accounts = value["accounts"].as_array().cloned().unwrap_or_default();
             if accounts.is_empty() {
-                println!("暂无账号。用 `apiproxy login --provider <workbuddy|qoder>` 授权登录。");
+                println!("暂无账号。用 `apip login --provider <workbuddy|qoder>` 授权登录。");
                 return Ok(());
             }
             println!(
