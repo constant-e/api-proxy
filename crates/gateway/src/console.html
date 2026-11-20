@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APIProxy Console</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --border: #e3e6ea;
+    --fg: #1f2328;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --ok: #15803d;
+    --warn: #b45309;
+    --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --surface: #171a21;
+      --border: #2a2f3a;
+      --fg: #e6e8eb;
+      --muted: #9aa3af;
+      --accent: #5b8cff;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --err: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 28px; border-bottom: 1px solid var(--border); background: var(--surface);
+  }
+  header h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+  header h1 span { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 22px 20px 80px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+  .tabs button {
+    background: none; border: 0; color: var(--muted); padding: 10px 16px;
+    cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent;
+  }
+  .tabs button.active { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 140px; flex: 1; }
+  .field.grow { flex: 3; }
+  .field.narrow { flex: 0 0 110px; }
+  .field.provider { flex: 0 0 220px; }
+  label { font-size: 12px; color: var(--muted); }
+  input, select {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 8px 10px; font: inherit; width: 100%;
+  }
+  input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); border-color: var(--accent); }
+  button.btn {
+    background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+    padding: 8px 14px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  button.btn.secondary { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+  button.btn.danger { background: transparent; color: var(--err); border: 1px solid var(--border); }
+  button.btn.small { padding: 4px 9px; font-size: 12px; }
+  button.btn:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.active { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+  .badge.disabled { color: var(--err); border-color: color-mix(in srgb, var(--err) 35%, var(--border)); }
+  .badge.cooldown { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; max-width: 380px;
+    background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: 8px;
+    opacity: 0; transform: translateY(8px); transition: .18s; pointer-events: none; font-size: 13px;
+  }
+  .toast.show { opacity: 1; transform: none; }
+  .toast.err { background: var(--err); color: #fff; }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 8px 12px; font-size: 13px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .empty { padding: 24px; text-align: center; color: var(--muted); }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .stat { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .stat .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .table-wrap { overflow-x: auto; }
+  .log-error { max-width: 280px; font-size: 11px; color: var(--err); word-break: break-all; }
+  .login { max-width: 420px; margin: 90px auto; }
+  code { font-family: ui-monospace, monospace; font-size: 12px; background: var(--bg); padding: 2px 5px; border-radius: 4px; }
+  @media (max-width: 640px) {
+    header { padding: 14px 16px; }
+    main { padding: 16px 12px 60px; }
+    .kv { grid-template-columns: 110px 1fr; }
+    .hide-sm { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>APIProxy <span>国产 AI → OpenAI Completions</span></h1>
+  <div id="status" class="muted mono"></div>
+</header>
+
+<div id="login" class="card login" hidden>
+  <h2>输入 API Key</h2>
+  <p class="hint">Key 位于数据目录的 <code>data.json</code>，也可运行 <code>apiproxy key</code> 查看。仅保存在本浏览器。</p>
+  <div class="field">
+    <label for="key-input">API Key</label>
+    <input id="key-input" type="password" placeholder="sk-..." autocomplete="off">
+  </div>
+  <p></p>
+  <button class="btn" id="key-save">进入 Console</button>
+  <div id="login-error" class="hint" style="color:var(--err)"></div>
+</div>
+
+<main id="app" hidden>
+  <nav class="tabs">
+    <button data-tab="accounts" class="active">账号</button>
+    <button data-tab="models">模型</button>
+    <button data-tab="providers">提供商</button>
+    <button data-tab="stats">统计</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+
+  <section id="tab-accounts">
+    <div class="card">
+      <h2>授权登录</h2>
+      <div class="row">
+        <div class="field provider">
+          <label for="login-provider">提供商</label>
+          <select id="login-provider"></select>
+        </div>
+        <div class="field narrow">
+          <label for="login-region">区域</label>
+          <select id="login-region">
+            <option value="cn">国内</option>
+            <option value="global">国际</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="login-name">名称（可选）</label>
+          <input id="login-name" placeholder="默认使用上游昵称">
+        </div>
+        <button class="btn" id="login-start" type="button">获取授权链接</button>
+      </div>
+      <div id="login-box" class="hint" hidden style="margin-top:12px">
+        <p style="margin:6px 0"><a id="login-url" target="_blank" rel="noopener" class="mono" style="word-break:break-all">授权链接</a></p>
+        <div id="login-status"></div>
+        <p><button class="btn secondary small" id="login-cancel" type="button">取消登录</button></p>
+      </div>
+      <div class="hint">生成链接后在浏览器完成授权；本页会自动轮询并添加账号。</div>
+    </div>
+    <div class="card">
+      <h2>账号</h2>
+      <div class="actions" style="margin-bottom:12px">
+        <button class="btn secondary small" id="checkin-all">全部签到</button>
+        <button class="btn secondary small" id="reload-accounts">刷新</button>
+      </div>
+      <div id="accounts-table"></div>
+    </div>
+  </section>
+
+  <section id="tab-models" hidden>
+    <div class="card">
+      <div class="actions" style="justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin:0">合并后的模型</h2>
+        <button class="btn secondary small" id="refresh-models">刷新模型</button>
+      </div>
+      <div id="models-meta" class="hint" style="margin-bottom:10px"></div>
+      <div id="models-table"></div>
+    </div>
+  </section>
+
+  <section id="tab-providers" hidden>
+    <div class="card">
+      <h2>提供商</h2>
+      <div id="providers-table"></div>
+      <div class="hint">Base URL 留空使用默认值；修改后会自动重新拉取模型。</div>
+    </div>
+  </section>
+
+  <section id="tab-stats" hidden>
+    <div class="card">
+      <div class="actions" style="justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin:0">用量与积分</h2>
+        <button class="btn secondary small" id="stats-refresh">刷新</button>
+      </div>
+      <div id="stats-cards" class="stats-grid"><div class="empty">加载中…</div></div>
+      <h2 style="margin:18px 0 8px">积分余额</h2>
+      <div id="credits-table"></div>
+      <div class="hint" id="credits-meta"></div>
+    </div>
+    <div class="card">
+      <h2>请求日志（最近 1000 条）</h2>
+      <div id="logs-table"></div>
+    </div>
+  </section>
+
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <h2>本机接入信息</h2>
+      <div class="kv">
+        <div>API Base</div><div class="mono" id="api-base"></div>
+        <div>API Key</div><div class="mono" id="api-key"></div>
+      </div>
+      <p class="hint">OpenAI SDK：<code>base_url</code> 填上面的 API Base，<code>api_key</code> 填 API Key。</p>
+    </div>
+    <div class="card">
+      <h2>网关设置</h2>
+      <form id="settings-form" class="row">
+        <div class="field narrow">
+          <label><input type="checkbox" id="set-auto" style="width:auto"> 自动签到</label>
+        </div>
+        <div class="field narrow">
+          <label for="set-time">签到时间</label>
+          <input id="set-time" type="time">
+        </div>
+        <div class="field narrow">
+          <label for="set-timeout">请求超时（秒，重启生效）</label>
+          <input id="set-timeout" type="number" min="10" max="3600">
+        </div>
+        <button class="btn" type="submit">保存设置</button>
+      </form>
+      <div class="hint" id="settings-meta"></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const state = {
+  key: localStorage.getItem("apiproxy_key") || "",
+  accounts: [],
+  providers: [],
+  models: [],
+  settings: {},
+  overview: {},
+  stats: null,
+};
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+let toastTimer = 0;
+function toast(message, isError = false) {
+  const el = $("#toast");
+  el.textContent = message;
+  el.className = "toast show" + (isError ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = "toast"; }, 3200);
+}
+
+async function api(path, method = "GET", body = null) {
+  const headers = { "Authorization": "Bearer " + state.key };
+  if (body !== null) headers["Content-Type"] = "application/json";
+  const resp = await fetch(path, {
+    method,
+    headers,
+    cache: "no-store",
+    body: body === null ? undefined : JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (resp.status === 401) {
+    showLogin("API Key 无效");
+    throw new Error("API Key 无效");
+  }
+  if (!resp.ok) {
+    const msg = data?.error?.message || data?.message || ("请求失败 (" + resp.status + ")");
+    throw new Error(msg);
+  }
+  return data;
+}
+
+function showLogin(message = "") {
+  $("#app").hidden = true;
+  $("#login").hidden = false;
+  $("#login-error").textContent = message;
+  state.key = "";
+  localStorage.removeItem("apiproxy_key");
+}
+
+function maskTime(ts) {
+  if (!ts) return "-";
+  return new Date(ts).toLocaleString();
+}
+
+async function loadAll() {
+  const [overview, accounts, providers, models, settings] = await Promise.all([
+    api("/api/admin/overview"),
+    api("/api/admin/accounts"),
+    api("/api/admin/providers"),
+    api("/api/admin/models"),
+    api("/api/admin/settings"),
+  ]);
+  state.overview = overview;
+  state.accounts = accounts.accounts || [];
+  state.providers = providers.providers || [];
+  state.models = models.models || [];
+  state.modelsMeta = models;
+  state.settings = settings;
+  $("#app").hidden = false;
+  $("#login").hidden = true;
+  renderAccounts();
+  renderModels();
+  renderProviders();
+  renderSettings();
+  renderStatus();
+}
+
+function renderStatus() {
+  const o = state.overview;
+  $("#status").textContent = `${o.active_accounts || 0}/${o.accounts || 0} 账号 · ${o.models || 0} 模型 · v${o.version || ""}`;
+}
+
+function renderAccounts() {
+  const el = $("#accounts-table");
+  if (!state.accounts.length) {
+    el.innerHTML = '<div class="empty">暂无账号。请使用上方「授权登录」添加账号。</div>';
+  } else {
+    const rows = state.accounts.map((a) => `
+      <tr>
+        <td class="mono">${esc(a.id)}</td>
+        <td>${esc(a.provider_name)}</td>
+        <td>${esc(a.name)}<div class="muted mono">${esc(a.credential_hint)}</div></td>
+        <td><span class="badge ${esc(a.status)}">${esc(statusText(a.status))}</span>
+          ${a.last_error ? `<div class="muted" style="font-size:11px;max-width:240px">${esc(a.last_error)}</div>` : ""}</td>
+        <td class="hide-sm">${a.last_checkin ? esc(a.last_checkin.message) : '<span class="muted">-</span>'}</td>
+        <td>
+          <div class="actions">
+            <button class="btn secondary small" data-act="test" data-id="${esc(a.id)}">测试</button>
+            <button class="btn secondary small" data-act="checkin" data-id="${esc(a.id)}">签到</button>
+            <button class="btn secondary small" data-act="toggle" data-id="${esc(a.id)}" data-enabled="${a.enabled}">${a.enabled ? "停用" : "启用"}</button>
+            <button class="btn danger small" data-act="delete" data-id="${esc(a.id)}">删除</button>
+          </div>
+        </td>
+      </tr>`).join("");
+    el.innerHTML = `<table>
+      <thead><tr><th>ID</th><th>提供商</th><th>名称</th><th>状态</th><th class="hide-sm">最近签到</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+  renderLoginProviders();
+}
+
+function renderLoginProviders() {
+  const select = $("#login-provider");
+  if (!select) return;
+  const current = select.value;
+  select.innerHTML = state.providers
+    .filter((p) => p.enabled && p.supports_login)
+    .map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`)
+    .join("");
+  if (current && [...select.options].some((o) => o.value === current)) select.value = current;
+}
+
+function statusText(status) {
+  return ({ active: "正常", cooldown: "冷却中", disabled: "已停用" })[status] || status;
+}
+
+function renderModels() {
+  const el = $("#models-table");
+  if (!state.models.length) {
+    el.innerHTML = '<div class="empty">暂无模型。请先通过授权登录添加账号。</div>';
+  } else {
+    const rows = state.models.map((m) => {
+      const providers = (m.providers || [m.provider]).join(" + ");
+      const upstreams = (m.upstream_ids || [m.upstream_id]).join(", ");
+      return `
+      <tr>
+        <td class="mono">${esc(m.id)} ${m.merged ? '<span class="badge active">合并</span>' : ""}</td>
+        <td>${esc(providers)}</td>
+        <td class="mono hide-sm">${esc(upstreams)}</td>
+        <td class="hide-sm">${m.reasoning ? '<span class="badge">推理</span>' : ""} ${m.vision ? '<span class="badge">视觉</span>' : ""}</td>
+      </tr>`;
+    }).join("");
+    el.innerHTML = `<table>
+      <thead><tr><th>模型 ID</th><th>提供商</th><th class="hide-sm">上游 ID</th><th class="hide-sm">能力</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+  const meta = state.modelsMeta || {};
+  $("#models-meta").textContent = meta.refreshed_at
+    ? `上次刷新 ${maskTime(meta.refreshed_at)}${meta.used_fallback ? " · 部分模型来自内置回退列表" : ""}`
+    : "";
+}
+
+function renderProviders() {
+  const el = $("#providers-table");
+  if (!state.providers.length) {
+    el.innerHTML = '<div class="empty">未加载提供商。</div>';
+    return;
+  }
+  const sourceLabel = { dynamic: "动态", cache: "缓存", fallback: "回退", disabled: "停用" };
+  const rows = state.providers.map((p) => {
+    const source = sourceLabel[p.models_source] || "-";
+    const error = p.model_error
+      ? `<div class="muted" style="font-size:11px;max-width:220px" title="${esc(p.model_error)}">${esc(String(p.model_error).slice(0, 90))}</div>`
+      : "";
+    return `
+    <tr data-provider="${esc(p.id)}">
+      <td><strong>${esc(p.name)}</strong><div class="muted mono">${esc(p.id)}</div></td>
+      <td>${p.account_count} 账号<br><span class="muted">${p.model_count} 模型 · ${source}</span>${error}</td>
+      <td><label><input type="checkbox" data-field="enabled" ${p.enabled ? "checked" : ""} style="width:auto"> 启用</label></td>
+      <td><label><input type="checkbox" data-field="auto_checkin" ${p.auto_checkin ? "checked" : ""} style="width:auto"> 自动签到</label></td>
+      <td><input class="mono" data-field="base_url" value="${esc(p.base_url || "")}" placeholder="${esc(p.default_base_url)}"></td>
+      <td><button class="btn secondary small" data-act="save-provider">保存</button></td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<table>
+    <thead><tr><th>提供商</th><th>规模</th><th></th><th></th><th>Base URL</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+function fmtNum(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+async function loadStats() {
+  $("#stats-cards").innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    state.stats = await api("/api/admin/stats");
+    renderStats();
+  } catch (e) {
+    $("#stats-cards").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    toast(e.message, true);
+  }
+}
+
+function renderStats() {
+  const s = state.stats || {};
+  const t = s.totals || {};
+  const cards = [
+    ["请求数", fmtNum(t.requests)],
+    ["错误数", fmtNum(t.errors)],
+    ["总 Tokens", fmtNum(t.total_tokens)],
+    ["提示 Tokens", fmtNum(t.prompt_tokens)],
+    ["补全 Tokens", fmtNum(t.completion_tokens)],
+    ["可用积分", s.credits && s.credits.total != null
+      ? `${fmtNum(s.credits.total)} ${s.credits.unit || ""}`.trim()
+      : (s.credits && (s.credits.units || []).length > 1 ? "多单位" : "-")],
+  ];
+  $("#stats-cards").innerHTML = cards
+    .map(([label, value]) => `<div class="stat"><div class="n">${esc(value)}</div><div class="l">${esc(label)}</div></div>`)
+    .join("");
+
+  const credits = (s.credits && s.credits.accounts) || [];
+  if (!credits.length) {
+    $("#credits-table").innerHTML = '<div class="empty">暂无账号或额度接口不可用</div>';
+  } else {
+    const rows = credits.map((c) => `
+      <tr>
+        <td>${esc(c.provider)}</td>
+        <td>${esc(c.name)}</td>
+        <td class="mono">${c.credits == null ? "-" : esc(`${fmtNum(c.credits)} ${c.unit || ""}`.trim())}
+          ${c.monthly_quota != null || c.total_quota != null ? `<div class="muted" style="font-size:11px">月 ${c.monthly_quota == null ? "-" : esc(fmtNum(c.monthly_quota))} · 累计 ${c.total_quota == null ? "-" : esc(fmtNum(c.total_quota))}</div>` : ""}</td>
+        <td class="hide-sm">${c.error ? `<span class="log-error">${esc(c.error)}</span>` : '<span class="muted">-</span>'}</td>
+      </tr>`).join("");
+    $("#credits-table").innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>提供商</th><th>账号</th><th>可用余额</th><th class="hide-sm">错误</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  }
+  $("#credits-meta").textContent = s.credits && s.credits.at
+    ? `额度更新于 ${maskTime(s.credits.at)}（60 秒缓存）`
+    : "";
+
+  const logs = s.logs || [];
+  if (!logs.length) {
+    $("#logs-table").innerHTML = '<div class="empty">暂无请求日志</div>';
+    return;
+  }
+  const rows = logs.map((l) => `
+    <tr>
+      <td class="mono hide-sm">#${esc(l.id)}</td>
+      <td class="hide-sm">${esc(maskTime(l.at))}</td>
+      <td class="mono">${esc(l.model)}${l.upstream_model && l.upstream_model !== l.model ? `<div class="muted">${esc(l.upstream_model)}</div>` : ""}</td>
+      <td>${esc(l.provider || "-")}<div class="muted">${esc(l.account || "")}</div></td>
+      <td><span class="badge ${l.status === "success" ? "active" : "disabled"}">${l.status === "success" ? "成功" : "错误"}</span><div class="muted mono">HTTP ${esc(l.http_status)}</div></td>
+      <td class="hide-sm mono">${esc(l.duration_ms)} ms</td>
+      <td class="mono hide-sm">${esc(fmtNum(l.total_tokens))}<div class="muted">${esc(fmtNum(l.prompt_tokens))} / ${esc(fmtNum(l.completion_tokens))}</div></td>
+      <td>${l.error ? `<span class="log-error">${esc(l.error)}</span>` : '<span class="muted">-</span>'}</td>
+    </tr>`).join("");
+  $("#logs-table").innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th class="hide-sm">ID</th><th class="hide-sm">时间</th><th>模型</th><th>提供商 / 账号</th><th>状态</th><th class="hide-sm">耗时</th><th class="hide-sm">Tokens</th><th>错误</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function renderSettings() {
+  const s = state.settings;
+  $("#set-auto").checked = !!s.auto_checkin;
+  $("#set-time").value = s.checkin_time || "08:00";
+  $("#set-timeout").value = s.request_timeout_secs || 180;
+  $("#settings-meta").textContent = s.last_auto_checkin ? `上次自动签到：${s.last_auto_checkin}` : "尚未执行自动签到";
+  $("#api-base").textContent = location.origin + "/v1";
+  $("#api-key").textContent = state.key;
+}
+
+// --- events ---
+
+function bindAccountActions() {
+  $("#accounts-table").addEventListener("click", async (event) => {
+    const btn = event.target.closest("button[data-act]");
+    if (!btn) return;
+    const id = btn.dataset.id;
+    const act = btn.dataset.act;
+    btn.disabled = true;
+    try {
+      if (act === "test") {
+        const r = await api(`/api/admin/accounts/${id}/test`, "POST", {});
+        toast(r.message || "凭证有效");
+      } else if (act === "checkin") {
+        const r = await api(`/api/admin/accounts/${id}/checkin`, "POST", {});
+        const item = (r.results || [])[0];
+        toast(item ? item.message : "签到完成");
+      } else if (act === "toggle") {
+        const enabled = btn.dataset.enabled !== "true";
+        await api(`/api/admin/accounts/${id}`, "PATCH", { enabled });
+        toast(enabled ? "已启用" : "已停用");
+      } else if (act === "delete") {
+        if (!confirm("确定删除该账号？")) return;
+        await api(`/api/admin/accounts/${id}`, "DELETE");
+        toast("已删除");
+      }
+      await loadAll();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+function bindProviderActions() {
+  $("#providers-table").addEventListener("click", async (event) => {
+    const btn = event.target.closest("button[data-act='save-provider']");
+    if (!btn) return;
+    const row = btn.closest("tr");
+    const id = row.dataset.provider;
+    const body = {
+      enabled: row.querySelector("[data-field='enabled']").checked,
+      auto_checkin: row.querySelector("[data-field='auto_checkin']").checked,
+      base_url: row.querySelector("[data-field='base_url']").value.trim() || null,
+    };
+    btn.disabled = true;
+    try {
+      await api(`/api/admin/providers/${id}`, "PATCH", body);
+      toast("已保存");
+      await loadAll();
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+let loginTimer = 0;
+let loginFlow = "";
+
+function stopLoginPolling() {
+  clearInterval(loginTimer);
+  loginTimer = 0;
+}
+
+function showLoginBox(url, message) {
+  $("#login-box").hidden = false;
+  const link = $("#login-url");
+  link.href = url;
+  link.textContent = url;
+  $("#login-status").textContent = message;
+}
+
+async function pollLogin() {
+  if (!loginFlow) return;
+  try {
+    const r = await api(`/api/admin/login/${encodeURIComponent(loginFlow)}`);
+    const status = r.status;
+    if (status === "pending") {
+      $("#login-status").textContent = r.message || "等待浏览器完成授权…";
+      return;
+    }
+    stopLoginPolling();
+    loginFlow = "";
+    if (status === "success") {
+      $("#login-status").textContent = "登录成功，账号已添加";
+      toast(`登录成功：${r.account?.name || ""}`);
+      await loadAll();
+      $("#login-box").hidden = true;
+    } else {
+      $("#login-status").textContent = r.message || status;
+      toast(r.message || "登录未完成", true);
+    }
+  } catch (e) {
+    stopLoginPolling();
+    loginFlow = "";
+    $("#login-status").textContent = e.message;
+    toast(e.message, true);
+  }
+}
+
+async function startLogin() {
+  stopLoginPolling();
+  if (loginFlow) {
+    const old = loginFlow;
+    loginFlow = "";
+    try { await api(`/api/admin/login/${encodeURIComponent(old)}/cancel`, "POST", {}); } catch (_) {}
+  }
+  const provider = $("#login-provider").value;
+  if (!provider) return toast("没有支持授权登录的提供商", true);
+  $("#login-start").disabled = true;
+  try {
+    const r = await api("/api/admin/login/start", "POST", {
+      provider,
+      region: $("#login-region").value || null,
+      name: $("#login-name").value.trim() || null,
+    });
+    loginFlow = r.flow_id;
+    showLoginBox(r.url, r.message || "等待浏览器完成授权…");
+    window.open(r.url, "_blank", "noopener");
+    loginTimer = setInterval(pollLogin, 2000);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    $("#login-start").disabled = false;
+  }
+}
+
+async function cancelLogin() {
+  stopLoginPolling();
+  const flow = loginFlow;
+  loginFlow = "";
+  $("#login-box").hidden = true;
+  if (flow) {
+    try { await api(`/api/admin/login/${encodeURIComponent(flow)}/cancel`, "POST", {}); } catch (_) {}
+  }
+}
+
+function bindTabs() {
+  document.querySelectorAll(".tabs button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      ["accounts", "models", "providers", "stats", "settings"].forEach((tab) => {
+        $("#tab-" + tab).hidden = tab !== btn.dataset.tab;
+      });
+      if (btn.dataset.tab === "stats") loadStats();
+    });
+  });
+}
+
+async function enter() {
+  try {
+    await loadAll();
+    localStorage.setItem("apiproxy_key", state.key);
+  } catch (e) {
+    // Keep the stored key on transient failures; only 401 removes it.
+    $("#login").hidden = false;
+    $("#login-error").textContent = e.message;
+    toast(e.message, true);
+  }
+}
+
+$("#key-save").addEventListener("click", () => {
+  const key = $("#key-input").value.trim();
+  if (!key) return;
+  state.key = key;
+  enter();
+});
+$("#key-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("#key-save").click();
+});
+
+$("#stats-refresh").addEventListener("click", () => loadStats());
+
+$("#refresh-models").addEventListener("click", async (e) => {
+  e.target.disabled = true;
+  try {
+    const r = await api("/api/admin/models/refresh", "POST", {});
+    toast(`已刷新，共 ${r.models} 个模型`);
+    await loadAll();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    e.target.disabled = false;
+  }
+});
+
+$("#checkin-all").addEventListener("click", async (e) => {
+  e.target.disabled = true;
+  try {
+    const r = await api("/api/admin/checkin", "POST", {});
+    const results = r.results || [];
+    const ok = results.filter((x) => x.status === "success").length;
+    const skipped = results.filter((x) => x.status === "already" || x.status === "skipped").length;
+    toast(`签到完成：成功 ${ok}，已签/跳过 ${skipped}${results.length - ok - skipped ? "，失败 " + (results.length - ok - skipped) : ""}`);
+    await loadAll();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    e.target.disabled = false;
+  }
+});
+
+$("#reload-accounts").addEventListener("click", () => loadAll().catch((e) => toast(e.message, true)));
+
+$("#settings-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await api("/api/admin/settings", "PATCH", {
+      auto_checkin: $("#set-auto").checked,
+      checkin_time: $("#set-time").value,
+      request_timeout_secs: Number($("#set-timeout").value),
+    });
+    toast("设置已保存");
+    await loadAll();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+bindTabs();
+bindAccountActions();
+bindProviderActions();
+$("#login-start").addEventListener("click", startLogin);
+$("#login-cancel").addEventListener("click", cancelLogin);
+if (state.key) enter(); else showLogin();
+</script>
+</body>
+</html>
