@@ -320,6 +320,13 @@ impl Store {
         if let Some(a) = self.data.accounts.iter_mut().find(|a| a.id == id) {
             a.last_error = None;
             a.cooldown_until = None;
+            // Auto-disable is a guess based on a rejection. A successful
+            // request or manual test proves the credential works, so undo it.
+            // Accounts disabled by hand have no reason and stay disabled.
+            if a.disabled_reason.is_some() {
+                a.enabled = true;
+                a.disabled_reason = None;
+            }
         }
     }
 }
@@ -406,5 +413,30 @@ mod tests {
 
         // Idempotent: nothing changes on the second pass.
         assert!(!store.migrate_stale_checkin_errors());
+    }
+
+    #[test]
+    fn success_reenables_auto_disabled_account_only() {
+        let mut store = Store {
+            path: PathBuf::from("/tmp/apiproxy-reenable-test.json"),
+            data: StoreFile::default(),
+        };
+        let mut auto = Account::new("qoder", "auto", "dt-auto");
+        auto.enabled = false;
+        auto.disabled_reason = Some("上游拒绝或额度耗尽，已自动停用".into());
+        let auto_id = auto.id.clone();
+        let mut manual = Account::new("qoder", "manual", "dt-manual");
+        manual.enabled = false;
+        let manual_id = manual.id.clone();
+        store.data.accounts.push(auto);
+        store.data.accounts.push(manual);
+
+        store.record_success(&auto_id);
+        assert!(store.data.accounts[0].enabled);
+        assert!(store.data.accounts[0].disabled_reason.is_none());
+
+        // A user-initiated disable carries no reason and must be preserved.
+        store.record_success(&manual_id);
+        assert!(!store.data.accounts[1].enabled);
     }
 }

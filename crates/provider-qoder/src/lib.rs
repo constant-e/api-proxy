@@ -221,27 +221,83 @@ fn session_key(account: &AccountView<'_>) -> String {
     )
 }
 
+/// Innermost Qoder business code in an error payload.
+///
+/// Qoder wraps the real code in a JSON *string* inside `message`, sometimes
+/// twice (`{"code":"403","message":"{\"code\":\"10605\",...}"}`), and the outer
+/// `code` is just the HTTP status. A flat lookup therefore misses 10605/112
+/// and the error is misread as an invalid credential.
+fn error_code(body: &str) -> String {
+    fn find(value: &Value, depth: usize) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        if let Some(code) = value.get("code") {
+            let code = code
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| code.as_i64().map(|n| n.to_string()));
+            if let Some(code) = code.filter(|c| !matches!(c.as_str(), "200" | "401" | "403")) {
+                return Some(code);
+            }
+        }
+        value
+            .get("message")
+            .and_then(Value::as_str)
+            .and_then(|message| serde_json::from_str::<Value>(message).ok())
+            .and_then(|inner| find(&inner, depth + 1))
+    }
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| find(&value, 0))
+        .unwrap_or_default()
+}
+
+/// Upstream-suggested wait (`retryAfterSeconds` / `waitTime`), also nested.
+fn retry_after_ms(body: &str) -> Option<i64> {
+    fn find(value: &Value, depth: usize) -> Option<i64> {
+        if depth > 4 {
+            return None;
+        }
+        for key in ["retryAfterSeconds", "waitTime"] {
+            if let Some(seconds) = value.get(key).and_then(Value::as_i64).filter(|n| *n > 0) {
+                return Some(seconds.saturating_mul(1000));
+            }
+        }
+        value
+            .get("message")
+            .and_then(Value::as_str)
+            .and_then(|message| serde_json::from_str::<Value>(message).ok())
+            .and_then(|inner| find(&inner, depth + 1))
+    }
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| find(&value, 0))
+}
+
 fn classify_stream_status(code: &str, detail: &str) -> ProviderError {
     match code {
         "401" => ProviderError::Auth(detail.chars().take(400).collect()),
         "429" => ProviderError::RateLimited {
             message: detail.chars().take(400).collect(),
-            retry_after_ms: 5_000,
+            retry_after_ms: retry_after_ms(detail).unwrap_or(5_000),
         },
         "403" => {
+            let business = error_code(detail);
             // code 112 / pricingUrl is a model/plan gate, not an invalid
             // credential. Treating it as account quota would put every account
             // into a 12h cooldown and make other models unusable.
-            let plan_gate = detail.contains("pricingUrl") || detail.contains("\"112\"");
-            if plan_gate {
+            if business == "112" || detail.contains("pricingUrl") {
                 ProviderError::BadRequest(format!(
                     "该模型当前不可用或需要订阅: {}",
                     detail.chars().take(300).collect::<String>()
                 ))
-            } else if detail.contains("10605") {
+            } else if business == "10605" || detail.contains("10605") {
+                // Admission control: account is queued upstream. Honor the
+                // advertised wait instead of retrying every couple of seconds.
                 ProviderError::RateLimited {
                     message: detail.chars().take(400).collect(),
-                    retry_after_ms: 2_000,
+                    retry_after_ms: retry_after_ms(detail).unwrap_or(2_000),
                 }
             } else {
                 ProviderError::Auth(detail.chars().take(400).collect())
@@ -259,29 +315,24 @@ fn classify_stream_status(code: &str, detail: &str) -> ProviderError {
 
 fn classify(status: u16, body: &str) -> ProviderError {
     let text: String = body.chars().take(400).collect();
-    // Qoder admission-control rejections use code 10605 over 401/403.
-    if let Ok(v) = serde_json::from_str::<Value>(body) {
-        let code = v
-            .get("code")
-            .map(|c| {
-                c.as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| c.to_string())
-            })
-            .unwrap_or_default();
-        if code == "10605" {
-            return ProviderError::RateLimited {
-                message: format!("网关繁忙: {text}"),
-                retry_after_ms: 2_000,
-            };
-        }
+    // Qoder admission-control rejections use code 10605 over 401/403 and plan
+    // gates use 112; neither means the credential is invalid.
+    let business = error_code(body);
+    if business == "10605" {
+        return ProviderError::RateLimited {
+            message: format!("网关繁忙: {text}"),
+            retry_after_ms: retry_after_ms(body).unwrap_or(2_000),
+        };
+    }
+    if business == "112" || body.contains("pricingUrl") {
+        return ProviderError::BadRequest(format!("该模型当前不可用或需要订阅: {text}"));
     }
     let msg = format!("HTTP {status}: {text}");
     match status {
         401 | 403 => ProviderError::Auth(msg),
         429 => ProviderError::RateLimited {
             message: msg,
-            retry_after_ms: 5_000,
+            retry_after_ms: retry_after_ms(body).unwrap_or(5_000),
         },
         _ if (400..500).contains(&status) => ProviderError::BadRequest(msg),
         _ => ProviderError::Unavailable(msg),
@@ -498,6 +549,44 @@ impl QoderProvider {
         if uid.is_empty() {
             return Err(ProviderError::Auth("OAuth 凭证未返回用户 ID".into()));
         }
+        // The OAuth userinfo payload has no tier field; the signed status
+        // endpoint does (`userType`, e.g. personal_professional_trial /
+        // teams). Sending the fallback "personal_standard" in the chat body
+        // puts paid accounts into the wrong upstream queue.
+        let user_type = {
+            let status_inner = json!({
+                "userId": uid,
+                "personalToken": "",
+                "securityOauthToken": "",
+                "refreshToken": "",
+                "needRefresh": false,
+                "authInfo": {}
+            });
+            let status = self
+                .signed_post(
+                    client,
+                    &chat_base(account),
+                    USER_STATUS_PATH,
+                    &status_inner,
+                    account,
+                )
+                .await;
+            let mut t = status
+                .ok()
+                .map(|v| str_field(&v, "userType"))
+                .unwrap_or_default();
+            if t.is_empty() {
+                t = str_field(&value, "user_type");
+            }
+            if t.is_empty() {
+                t = str_field(&value, "userType");
+            }
+            if t.is_empty() {
+                "personal_standard".into()
+            } else {
+                t
+            }
+        };
         let identity = crypto::Identity {
             name: {
                 let n = str_field(&value, "name");
@@ -508,14 +597,7 @@ impl QoderProvider {
                 }
             },
             uid,
-            user_type: {
-                let t = str_field(&value, "user_type");
-                if t.is_empty() {
-                    "personal_standard".into()
-                } else {
-                    t
-                }
-            },
+            user_type,
             security_oauth_token: account.credential.to_string(),
             refresh_token: account.refresh_token.unwrap_or("").to_string(),
         };
@@ -815,18 +897,23 @@ impl Provider for QoderProvider {
                 .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
             let status = resp.status().as_u16();
             if status == 401 || status == 403 {
-                // Admission-control rejections (code 10605) also ride 401/403;
-                // refreshing the session cannot help and just adds latency.
+                // Admission-control rejections (code 10605) and plan gates
+                // (code 112) also ride 401/403; refreshing the session cannot
+                // help and just adds latency.
                 let text = resp.text().await.unwrap_or_default();
-                if matches!(classify(status, &text), ProviderError::RateLimited { .. }) {
-                    return Err(classify(status, &text));
+                let err = classify(status, &text);
+                if matches!(
+                    err,
+                    ProviderError::RateLimited { .. } | ProviderError::BadRequest(_)
+                ) {
+                    return Err(err);
                 }
                 self.invalidate(account).await;
                 if attempt == 0 {
                     attempt += 1;
                     continue;
                 }
-                return Err(classify(status, &text));
+                return Err(err);
             }
             if status >= 400 {
                 let retry_after = resp
@@ -1579,6 +1666,32 @@ mod tests {
         assert_eq!(body["messages"][1]["contents"][0]["text"], "hi");
         assert_eq!(body["parameters"]["temperature"], 0.2);
         assert_eq!(body["aliyun_user_type"], "personal_standard");
+    }
+
+    #[test]
+    fn nested_business_codes_drive_classification() {
+        // HTTP 403 whose real cause (10605, queued) is a JSON string inside
+        // `message`. Must not be reported as an invalid credential.
+        let body = r#"{"code":"403","message":"{\"code\":\"10605\",\"message\":\"{\\\"retryAfterSeconds\\\":60,\\\"isQueued\\\":true}\",\"subCode\":\"RESOURCE_LIMIT\"}"}"#;
+        match classify(403, body) {
+            ProviderError::RateLimited { retry_after_ms, .. } => assert_eq!(retry_after_ms, 60_000),
+            other => panic!("unexpected: {other}"),
+        }
+        match classify_stream_status("403", body) {
+            ProviderError::RateLimited { retry_after_ms, .. } => assert_eq!(retry_after_ms, 60_000),
+            other => panic!("unexpected: {other}"),
+        }
+
+        // Plan gate (112) is account-specific, not an auth failure.
+        let body = r#"{"code":"403","message":"{\"code\":\"112\",\"message\":\"{\\\"pricingUrl\\\":\\\"https://qoder.com.cn/pricing\\\"}\"}"}"#;
+        assert!(matches!(classify(403, body), ProviderError::BadRequest(_)));
+        assert!(matches!(
+            classify_stream_status("403", body),
+            ProviderError::BadRequest(_)
+        ));
+
+        // A bare 403 is still an auth failure.
+        assert!(matches!(classify(403, "{}"), ProviderError::Auth(_)));
     }
 
     #[test]

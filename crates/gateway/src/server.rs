@@ -381,7 +381,14 @@ fn mark_failure(state: &AppState, account_id: &str, err: &ProviderError) {
 
 fn mark_success(state: &AppState, account_id: &str) {
     if let Ok(mut store) = state.store.write() {
+        let was_auto_disabled = store
+            .account(account_id)
+            .map(|a| !a.enabled && a.disabled_reason.is_some())
+            .unwrap_or(false);
         store.record_success(account_id);
+        if was_auto_disabled {
+            let _ = store.save();
+        }
     }
 }
 
@@ -394,6 +401,25 @@ async fn open_stream(
 ) -> Result<ChatStreamResult, ProviderError> {
     let mut last_err = ProviderError::Unavailable("没有可用账号".into());
     let mut limit_hint: Option<(i64, String)> = None;
+    // A provider-wide model limit is only justified when every account for the
+    // provider hit a rate/quota limit. If any account was rejected for another
+    // reason (plan gate, bad request), another account may still serve it.
+    let mut all_limited = true;
+    // `accounts` may be a subset: `candidate_accounts` removes accounts that
+    // are cooling down. Those accounts never reported a model limit, so they
+    // must not be covered by a provider-wide ban either.
+    let covered_all = {
+        let enabled = state
+            .store
+            .read()
+            .unwrap()
+            .data
+            .accounts
+            .iter()
+            .filter(|a| a.provider == provider.id() && a.enabled)
+            .count();
+        accounts.len() >= enabled
+    };
     for account in accounts {
         let view = {
             let store = state.store.read().unwrap();
@@ -416,12 +442,9 @@ async fn open_stream(
                             error = %err,
                             "stream rejected before first chunk"
                         );
-                        if let Some((duration, reason)) = limit_from_error(&err) {
-                            // Plan/subscription limits can be account-specific;
-                            // try the next account and record only if all fail.
-                            limit_hint = Some((duration, reason));
-                        } else if matches!(err, ProviderError::BadRequest(_)) {
-                            return Err(err);
+                        match limit_from_error(&err) {
+                            Some((duration, reason)) => limit_hint = Some((duration, reason)),
+                            None => all_limited = false,
                         }
                         mark_failure(state, &account.id, &err);
                         last_err = err;
@@ -452,28 +475,26 @@ async fn open_stream(
             }
             Err(err) => {
                 tracing::warn!(provider = provider.id(), account = %account.name, error = %err, "chat open failed");
-                if let Some((duration, reason)) = limit_from_error(&err) {
-                    limit_hint = Some((duration, reason));
-                } else if matches!(err, ProviderError::BadRequest(_)) {
-                    return Err(err);
+                match limit_from_error(&err) {
+                    Some((duration, reason)) => limit_hint = Some((duration, reason)),
+                    None => all_limited = false,
                 }
                 mark_failure(state, &account.id, &err);
                 last_err = err;
             }
         }
     }
-    if let Some((duration, reason)) = limit_hint {
-        // Only mark the model limited after every account for this provider
-        // failed; a later account may have succeeded, so per-account 429s must
-        // not poison the whole provider for future requests.
-        record_limit_hint(
-            &state.model_limits,
-            provider.id(),
-            upstream_model,
-            duration,
-            &reason,
-        )
-        .await;
+    if all_limited && covered_all {
+        if let Some((duration, reason)) = limit_hint {
+            record_limit_hint(
+                &state.model_limits,
+                provider.id(),
+                upstream_model,
+                duration,
+                &reason,
+            )
+            .await;
+        }
     }
     Err(last_err)
 }
@@ -496,26 +517,12 @@ fn limit_key(provider: &str, upstream_model: &str) -> String {
 fn limit_from_error(err: &ProviderError) -> Option<(i64, String)> {
     let reason = err.to_string();
     match err {
+        // Only signals that apply to the upstream as a whole may become a
+        // provider-wide model limit. `BadRequest` is account-specific (plan
+        // gate / model permission): promoting it to a one-hour ban would stop
+        // routing to every other account that can still serve the model.
         ProviderError::RateLimited { retry_after_ms, .. } => {
             Some(((*retry_after_ms).max(30_000), reason))
-        }
-        ProviderError::BadRequest(message) => {
-            let lower = message.to_ascii_lowercase();
-            if lower.contains("rate limit")
-                || lower.contains("too many requests")
-                || lower.contains("quota")
-                || lower.contains("daily")
-                || lower.contains("exceeded")
-                || lower.contains("pricing")
-                || lower.contains("try again")
-                || message.contains("额度")
-                || message.contains("限流")
-                || message.contains("订阅")
-            {
-                Some((3_600_000, reason))
-            } else {
-                None
-            }
         }
         _ => None,
     }
@@ -2244,9 +2251,11 @@ mod routing_tests {
             retry_after_ms: 120_000,
         };
         assert_eq!(limit_from_error(&err).unwrap().0, 120_000);
+        // Plan gates and other per-account rejections must not ban the model
+        // for every account of the provider.
         let err = ProviderError::BadRequest("daily limit exceeded".into());
-        assert!(limit_from_error(&err).is_some());
-        let err = ProviderError::BadRequest("bad message".into());
+        assert!(limit_from_error(&err).is_none());
+        let err = ProviderError::BadRequest("该模型当前不可用或需要订阅".into());
         assert!(limit_from_error(&err).is_none());
     }
 
@@ -2473,11 +2482,89 @@ mod routing_tests {
             .contains_key(&limit_key("fake", "m")));
 
         state.model_limits.lock().await.clear();
+        // One account is rate-limited, another only plan-gated: the provider
+        // must stay eligible because the plan gate is account-specific.
+        let mixed = vec![
+            Account::new("fake", "bad3", "bad"),
+            Account::new("fake", "plan3", "plan"),
+        ];
+        let result =
+            open_stream(&state, provider.clone(), mixed, &serde_json::json!({}), "m").await;
+        assert!(result.is_err());
+        assert!(state.model_limits.lock().await.is_empty());
+
+        state.model_limits.lock().await.clear();
         let all_plan = vec![
             Account::new("fake", "plan", "plan"),
             Account::new("fake", "plan2", "plan"),
         ];
         let result = open_stream(&state, provider, all_plan, &serde_json::json!({}), "m").await;
+        assert!(result.is_err());
+        // Plan gates are account-specific: another account (or one added
+        // later) may still serve the model, so no provider-wide ban.
+        assert!(state.model_limits.lock().await.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn provider_limit_requires_every_enabled_account_to_be_attempted() {
+        let dir = std::env::temp_dir().join(format!(
+            "apip-coverage-test-{}-{}",
+            std::process::id(),
+            gateway_core::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut base = routing_state(&dir);
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider);
+        base.providers = vec![provider.clone()];
+        let state = Arc::new(base);
+
+        let mut cooling = Account::new("fake", "cooling", "good");
+        cooling.cooldown_until = Some(gateway_core::now_ms() + 60_000);
+        let bad1 = Account::new("fake", "bad1", "bad");
+        let bad2 = Account::new("fake", "bad2", "bad");
+        {
+            let mut store = state.store.write().unwrap();
+            store.data.accounts.push(cooling);
+            store.data.accounts.push(bad1.clone());
+            store.data.accounts.push(bad2.clone());
+        }
+
+        // The cooling account is enabled but was not attempted; a limit from
+        // the available accounts must not cover it.
+        let attempted = vec![bad1.clone(), bad2.clone()];
+        let result = open_stream(
+            &state,
+            provider.clone(),
+            attempted,
+            &serde_json::json!({}),
+            "m",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(state.model_limits.lock().await.is_empty());
+
+        // Disable the cooling account: now the same attempt covers every
+        // enabled account, so the provider-wide limit is justified.
+        let cooling_id = state.store.read().unwrap().data.accounts[0].id.clone();
+        state
+            .store
+            .write()
+            .unwrap()
+            .data
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == cooling_id)
+            .unwrap()
+            .enabled = false;
+        let result = open_stream(
+            &state,
+            provider,
+            vec![bad1, bad2],
+            &serde_json::json!({}),
+            "m",
+        )
+        .await;
         assert!(result.is_err());
         assert!(state
             .model_limits
