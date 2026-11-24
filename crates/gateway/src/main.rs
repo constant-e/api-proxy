@@ -231,6 +231,8 @@ async fn serve(cli: Cli, port_override: Option<u16>) -> Result<()> {
         logins: tokio::sync::Mutex::new(Default::default()),
         stats: Arc::new(crate::stats::StatsStore::load(&dir)),
         credits: tokio::sync::Mutex::new(None),
+        model_limits: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        session_pins: Arc::new(tokio::sync::Mutex::new(Default::default())),
     });
 
     let registry = server::refresh_registry(&state).await;

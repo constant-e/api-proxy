@@ -1,6 +1,7 @@
 //! Gateway HTTP server: OpenAI API, admin API and the embedded console.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use axum::body::Bytes;
@@ -20,6 +21,22 @@ use gateway_core::{
 
 use crate::stats::{usage_cached_tokens, usage_credits, usage_tokens, RequestLog, StatsStore};
 use serde_json::{json, Value};
+
+#[derive(Clone)]
+pub struct ModelLimit {
+    pub until_ms: i64,
+    pub reason: String,
+}
+
+#[derive(Clone)]
+pub struct SessionPin {
+    pub provider: String,
+    pub upstream_model: String,
+    pub at: i64,
+}
+
+pub type ModelLimits = Arc<tokio::sync::Mutex<HashMap<String, ModelLimit>>>;
+pub type SessionPins = Arc<tokio::sync::Mutex<HashMap<String, SessionPin>>>;
 
 #[derive(Clone)]
 pub struct CreditSnapshot {
@@ -50,6 +67,8 @@ pub struct AppState {
     pub logins: tokio::sync::Mutex<HashMap<String, PendingLogin>>,
     pub stats: Arc<StatsStore>,
     pub credits: tokio::sync::Mutex<Option<CreditSnapshot>>,
+    pub model_limits: ModelLimits,
+    pub session_pins: SessionPins,
 }
 
 impl AppState {
@@ -374,6 +393,7 @@ async fn open_stream(
     upstream_model: &str,
 ) -> Result<ChatStreamResult, ProviderError> {
     let mut last_err = ProviderError::Unavailable("没有可用账号".into());
+    let mut limit_hint: Option<(i64, String)> = None;
     for account in accounts {
         let view = {
             let store = state.store.read().unwrap();
@@ -396,7 +416,11 @@ async fn open_stream(
                             error = %err,
                             "stream rejected before first chunk"
                         );
-                        if matches!(err, ProviderError::BadRequest(_)) {
+                        if let Some((duration, reason)) = limit_from_error(&err) {
+                            // Plan/subscription limits can be account-specific;
+                            // try the next account and record only if all fail.
+                            limit_hint = Some((duration, reason));
+                        } else if matches!(err, ProviderError::BadRequest(_)) {
                             return Err(err);
                         }
                         mark_failure(state, &account.id, &err);
@@ -428,13 +452,28 @@ async fn open_stream(
             }
             Err(err) => {
                 tracing::warn!(provider = provider.id(), account = %account.name, error = %err, "chat open failed");
-                if matches!(err, ProviderError::BadRequest(_)) {
+                if let Some((duration, reason)) = limit_from_error(&err) {
+                    limit_hint = Some((duration, reason));
+                } else if matches!(err, ProviderError::BadRequest(_)) {
                     return Err(err);
                 }
                 mark_failure(state, &account.id, &err);
                 last_err = err;
             }
         }
+    }
+    if let Some((duration, reason)) = limit_hint {
+        // Only mark the model limited after every account for this provider
+        // failed; a later account may have succeeded, so per-account 429s must
+        // not poison the whole provider for future requests.
+        record_limit_hint(
+            &state.model_limits,
+            provider.id(),
+            upstream_model,
+            duration,
+            &reason,
+        )
+        .await;
     }
     Err(last_err)
 }
@@ -445,6 +484,203 @@ struct ChatStreamResult {
     account_name: String,
     provider_id: String,
     upstream_model: String,
+}
+
+const SESSION_TTL_MS: i64 = 30 * 60 * 1000;
+const CREDIT_FRESH_MS: i64 = 10 * 60 * 1000;
+
+fn limit_key(provider: &str, upstream_model: &str) -> String {
+    format!("{provider}\u{0}{upstream_model}")
+}
+
+fn limit_from_error(err: &ProviderError) -> Option<(i64, String)> {
+    let reason = err.to_string();
+    match err {
+        ProviderError::RateLimited { retry_after_ms, .. } => {
+            Some(((*retry_after_ms).max(30_000), reason))
+        }
+        ProviderError::BadRequest(message) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("rate limit")
+                || lower.contains("too many requests")
+                || lower.contains("quota")
+                || lower.contains("daily")
+                || lower.contains("exceeded")
+                || lower.contains("pricing")
+                || lower.contains("try again")
+                || message.contains("额度")
+                || message.contains("限流")
+                || message.contains("订阅")
+            {
+                Some((3_600_000, reason))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn record_limit_hint(
+    limits: &ModelLimits,
+    provider: &str,
+    upstream_model: &str,
+    duration_ms: i64,
+    reason: &str,
+) {
+    let key = limit_key(provider, upstream_model);
+    let until = gateway_core::now_ms() + duration_ms;
+    tracing::warn!(
+        provider,
+        upstream_model,
+        until_ms = until,
+        reason,
+        "model time-window limit recorded"
+    );
+    limits.lock().await.insert(
+        key,
+        ModelLimit {
+            until_ms: until,
+            reason: reason.chars().take(300).collect(),
+        },
+    );
+}
+
+async fn note_model_limit(
+    limits: &ModelLimits,
+    provider: &str,
+    upstream_model: &str,
+    err: &ProviderError,
+) {
+    if let Some((duration_ms, reason)) = limit_from_error(err) {
+        record_limit_hint(limits, provider, upstream_model, duration_ms, &reason).await;
+    }
+}
+
+fn session_key(headers: &HeaderMap, request: &Value, model: &str) -> String {
+    let explicit = headers
+        .get("x-session-id")
+        .or_else(|| headers.get("x-conversation-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            ["session_id", "conversation_id"]
+                .iter()
+                .find_map(|key| request.get(*key).and_then(Value::as_str))
+                .map(str::to_string)
+        });
+    if let Some(id) = explicit.filter(|id| !id.trim().is_empty()) {
+        return format!("{model}:explicit:{id}");
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    model.hash(&mut hasher);
+    if let Some(user) = request.get("user").and_then(Value::as_str) {
+        user.hash(&mut hasher);
+    }
+    if let Some(messages) = request.get("messages").and_then(Value::as_array) {
+        // Hash only the opening system message and the first user message.
+        // Later turns append messages, so hashing a fixed prefix keeps the
+        // same conversation on the same model variant across requests.
+        let mut has_system = false;
+        let mut has_user = false;
+        for message in messages {
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            if role == "system" && !has_system {
+                has_system = true;
+            } else if role == "user" && !has_user {
+                has_user = true;
+            } else {
+                continue;
+            }
+            serde_json::to_string(message)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            if has_user {
+                break;
+            }
+        }
+    }
+    format!("{model}:h:{:x}", hasher.finish())
+}
+
+fn provider_credit_score(snapshot: &Option<CreditSnapshot>, provider: &str) -> f64 {
+    let Some(snapshot) = snapshot else {
+        return 0.0;
+    };
+    if gateway_core::now_ms() - snapshot.at > CREDIT_FRESH_MS {
+        return 0.0;
+    }
+    snapshot
+        .accounts
+        .iter()
+        .filter(|row| row.get("provider").and_then(Value::as_str) == Some(provider))
+        .filter(|row| row.get("unit").and_then(Value::as_str) == Some("credits"))
+        .filter_map(|row| row.get("credits").and_then(Value::as_f64))
+        .sum()
+}
+
+async fn order_variants(
+    state: &AppState,
+    variants: &[(String, String)],
+    session: &str,
+) -> Result<Vec<(String, String)>, (i64, String)> {
+    let now = gateway_core::now_ms();
+    let pin = {
+        let mut pins = state.session_pins.lock().await;
+        pins.retain(|_, pin| now - pin.at <= SESSION_TTL_MS);
+        pins.get(session).cloned()
+    };
+    let credits = state.credits.lock().await.clone();
+    let limits = {
+        let mut limits = state.model_limits.lock().await;
+        limits.retain(|_, limit| limit.until_ms > now);
+        limits.clone()
+    };
+
+    let mut available: Vec<(usize, (String, String), f64, bool)> = Vec::new();
+    let mut earliest: Option<(i64, String)> = None;
+    for (index, (provider, upstream)) in variants.iter().enumerate() {
+        if let Some(limit) = limits.get(&limit_key(provider, upstream)) {
+            let entry = (limit.until_ms, limit.reason.clone());
+            if earliest
+                .as_ref()
+                .map(|(t, _)| limit.until_ms < *t)
+                .unwrap_or(true)
+            {
+                earliest = Some(entry);
+            }
+            continue;
+        }
+        let pinned = pin
+            .as_ref()
+            .map(|p| p.provider == *provider && p.upstream_model == *upstream)
+            .unwrap_or(false);
+        let score = provider_credit_score(&credits, provider);
+        available.push((index, (provider.clone(), upstream.clone()), score, pinned));
+    }
+    if available.is_empty() {
+        return Err(earliest.unwrap_or((now + 60_000, "所有提供商当前不可用".into())));
+    }
+    available.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(available
+        .into_iter()
+        .map(|(_, variant, _, _)| variant)
+        .collect())
+}
+
+async fn pin_session(state: &AppState, session: &str, provider: &str, upstream_model: &str) {
+    state.session_pins.lock().await.insert(
+        session.to_string(),
+        SessionPin {
+            provider: provider.to_string(),
+            upstream_model: upstream_model.to_string(),
+            at: gateway_core::now_ms(),
+        },
+    );
 }
 
 fn base_log(model: &str, stream: bool) -> RequestLog {
@@ -585,10 +821,29 @@ async fn chat_completions(
         );
     };
 
+    let session = session_key(&headers, &request, model_id);
+    let ordered = match order_variants(&state, &plan.variants, &session).await {
+        Ok(variants) => variants,
+        Err((until, reason)) => {
+            let when = chrono::DateTime::from_timestamp_millis(until)
+                .map(|dt| {
+                    dt.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| until.to_string());
+            let msg = format!("模型 {model_id} 处于时段限额：{reason}；最早恢复 {when}");
+            let mut log = base_log(model_id, wants_stream);
+            log.provider = plan.variants.first().map(|(p, _)| p.clone());
+            finish_chat_log(&state, log, started, "error", 429, None, Some(msg.clone()));
+            return json_error(StatusCode::TOO_MANY_REQUESTS, msg, "rate_limit_error");
+        }
+    };
+
     let mut stream_result: Option<ChatStreamResult> = None;
     let mut last_err: Option<ProviderError> = None;
     let mut unavailable: Vec<String> = Vec::new();
-    for (variant_provider, upstream_model) in &plan.variants {
+    for (variant_provider, upstream_model) in &ordered {
         let Some(provider) = state.provider(variant_provider) else {
             unavailable.push(format!("{variant_provider}: 未加载"));
             continue;
@@ -642,6 +897,14 @@ async fn chat_completions(
         return json_error(StatusCode::SERVICE_UNAVAILABLE, msg, "no_account");
     };
 
+    pin_session(
+        &state,
+        &session,
+        &stream_result.provider_id,
+        &stream_result.upstream_model,
+    )
+    .await;
+
     let id = openai::new_completion_id();
     let created = chrono::Utc::now().timestamp();
     let model_name = model_id.to_string();
@@ -659,6 +922,7 @@ async fn chat_completions(
             model_name,
             include_usage,
             state.stats.clone(),
+            state.model_limits.clone(),
             log,
             started,
         );
@@ -691,6 +955,13 @@ async fn chat_completions(
             }
             Err(err) => {
                 mark_failure(&state, &stream_result.account_id, &err);
+                note_model_limit(
+                    &state.model_limits,
+                    &stream_result.provider_id,
+                    &stream_result.upstream_model,
+                    &err,
+                )
+                .await;
                 let http = err.http_status();
                 finish_chat_log(
                     &state,
@@ -773,9 +1044,12 @@ fn sse_response(
     model: String,
     include_usage: bool,
     stats: Arc<StatsStore>,
+    limits: ModelLimits,
     mut log: RequestLog,
     started: std::time::Instant,
 ) -> Response {
+    let limit_provider = log.provider.clone().unwrap_or_default();
+    let limit_upstream = log.upstream_model.clone().unwrap_or_default();
     let body_stream = async_stream::stream! {
         let mut sent_role = false;
         let mut finish_sent = false;
@@ -815,6 +1089,9 @@ fn sse_response(
                     yield Ok(Bytes::from(format!("data: {chunk}\n\n")));
                 }
                 Err(err) => {
+                    if !limit_provider.is_empty() && !limit_upstream.is_empty() {
+                        note_model_limit(&limits, &limit_provider, &limit_upstream, &err).await;
+                    }
                     stream_error = Some(err.to_string());
                     let payload = openai::error_body(err.to_string(), "upstream_error", None);
                     yield Ok(Bytes::from(format!("data: {payload}\n\n")));
@@ -1867,8 +2144,17 @@ fn valid_hhmm(value: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn spawn_scheduler(state: Arc<AppState>) {
+    // Prime balances shortly after startup so routing can use them.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let snapshot = fetch_credits(&state).await;
+            *state.credits.lock().await = Some(snapshot);
+        });
+    }
     tokio::spawn(async move {
         let mut last_model_refresh = 0i64;
+        let mut last_credit_refresh = gateway_core::now_ms();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             let now = chrono::Local::now();
@@ -1903,6 +2189,301 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
                 let registry = refresh_registry(&state).await;
                 *state.registry.write().unwrap() = registry;
             }
+            if gateway_core::now_ms() - last_credit_refresh > 300_000 {
+                last_credit_refresh = gateway_core::now_ms();
+                let snapshot = fetch_credits(&state).await;
+                *state.credits.lock().await = Some(snapshot);
+            }
         }
     });
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn request(messages: Value) -> Value {
+        serde_json::json!({"model": "glm-5.3", "messages": messages})
+    }
+
+    #[test]
+    fn session_key_is_stable_across_appended_turns() {
+        let headers = HeaderMap::new();
+        let first = request(serde_json::json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello"}
+        ]));
+        let later = request(serde_json::json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "again"}
+        ]));
+        let other = request(serde_json::json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "different"}
+        ]));
+        let key = session_key(&headers, &first, "glm-5.3");
+        assert_eq!(key, session_key(&headers, &later, "glm-5.3"));
+        assert_ne!(key, session_key(&headers, &other, "glm-5.3"));
+    }
+
+    #[test]
+    fn explicit_session_header_wins() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("abc"));
+        let key = session_key(&headers, &request(serde_json::json!([])), "glm-5.3");
+        assert_eq!(key, "glm-5.3:explicit:abc");
+    }
+
+    #[test]
+    fn records_model_time_window_limits() {
+        let err = ProviderError::RateLimited {
+            message: "slow down".into(),
+            retry_after_ms: 120_000,
+        };
+        assert_eq!(limit_from_error(&err).unwrap().0, 120_000);
+        let err = ProviderError::BadRequest("daily limit exceeded".into());
+        assert!(limit_from_error(&err).is_some());
+        let err = ProviderError::BadRequest("bad message".into());
+        assert!(limit_from_error(&err).is_none());
+    }
+
+    #[test]
+    fn credit_score_ignores_other_units() {
+        let snapshot = Some(CreditSnapshot {
+            at: gateway_core::now_ms(),
+            total: Some(150.0),
+            monthly_quota: None,
+            total_quota: None,
+            unit: Some("credits".into()),
+            units: vec!["credits".into()],
+            accounts: vec![
+                serde_json::json!({"provider":"qoder","credits":100.0,"unit":"credits"}),
+                serde_json::json!({"provider":"qoder","credits":50.0,"unit":"tokens"}),
+                serde_json::json!({"provider":"workbuddy","credits":0.0,"unit":"credits"}),
+            ],
+        });
+        assert_eq!(provider_credit_score(&snapshot, "qoder"), 100.0);
+        assert_eq!(provider_credit_score(&snapshot, "workbuddy"), 0.0);
+        assert_eq!(provider_credit_score(&None, "qoder"), 0.0);
+    }
+    fn routing_state(dir: &std::path::Path) -> AppState {
+        let store = Store::load(dir, &[]).unwrap();
+        AppState {
+            store: Arc::new(RwLock::new(store)),
+            providers: Vec::new(),
+            registry: Arc::new(RwLock::new(ModelRegistry::default())),
+            client: reqwest::Client::new(),
+            started_at: gateway_core::now_ms(),
+            cursors: tokio::sync::Mutex::new(HashMap::new()),
+            logins: tokio::sync::Mutex::new(HashMap::new()),
+            stats: Arc::new(StatsStore::load(dir)),
+            credits: tokio::sync::Mutex::new(None),
+            model_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            session_pins: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_prefers_credits_then_session_pin_then_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "apip-routing-test-{}-{}",
+            std::process::id(),
+            gateway_core::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = routing_state(&dir);
+        let variants = vec![
+            ("workbuddy".to_string(), "glm-5.3".to_string()),
+            ("qoder".to_string(), "gmodel".to_string()),
+        ];
+        *state.credits.lock().await = Some(CreditSnapshot {
+            at: gateway_core::now_ms(),
+            total: Some(100.0),
+            monthly_quota: None,
+            total_quota: None,
+            unit: Some("credits".into()),
+            units: vec!["credits".into()],
+            accounts: vec![
+                serde_json::json!({"provider":"workbuddy","credits":0.0,"unit":"credits"}),
+                serde_json::json!({"provider":"qoder","credits":100.0,"unit":"credits"}),
+            ],
+        });
+
+        let ordered = order_variants(&state, &variants, "session-a")
+            .await
+            .unwrap();
+        assert_eq!(ordered[0].0, "qoder");
+
+        state.session_pins.lock().await.insert(
+            "session-a".into(),
+            SessionPin {
+                provider: "workbuddy".into(),
+                upstream_model: "glm-5.3".into(),
+                at: gateway_core::now_ms(),
+            },
+        );
+        let ordered = order_variants(&state, &variants, "session-a")
+            .await
+            .unwrap();
+        assert_eq!(ordered[0].0, "workbuddy");
+
+        state.model_limits.lock().await.insert(
+            limit_key("workbuddy", "glm-5.3"),
+            ModelLimit {
+                until_ms: gateway_core::now_ms() + 60_000,
+                reason: "daily limit".into(),
+            },
+        );
+        let ordered = order_variants(&state, &variants, "session-a")
+            .await
+            .unwrap();
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].0, "qoder");
+
+        state.model_limits.lock().await.insert(
+            limit_key("qoder", "gmodel"),
+            ModelLimit {
+                until_ms: gateway_core::now_ms() + 60_000,
+                reason: "quota".into(),
+            },
+        );
+        assert!(order_variants(&state, &variants, "session-a")
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    struct FakeProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for FakeProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn name(&self) -> &'static str {
+            "Fake"
+        }
+        fn default_base_url(&self) -> &'static str {
+            "http://localhost"
+        }
+        fn fallback_models(&self) -> Vec<RemoteModel> {
+            Vec::new()
+        }
+        async fn models(
+            &self,
+            _client: &reqwest::Client,
+            _account: &gateway_core::AccountView<'_>,
+        ) -> Result<Vec<RemoteModel>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn chat(
+            &self,
+            _client: &reqwest::Client,
+            account: &gateway_core::AccountView<'_>,
+            _request: &Value,
+            _upstream_model: &str,
+        ) -> Result<gateway_core::ChatStream, ProviderError> {
+            if account.credential == "bad" {
+                Err(ProviderError::RateLimited {
+                    message: "per-account limit".into(),
+                    retry_after_ms: 60_000,
+                })
+            } else if account.credential == "plan" {
+                Err(ProviderError::BadRequest(
+                    "该模型当前不可用或需要订阅".into(),
+                ))
+            } else {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+        async fn checkin(
+            &self,
+            _client: &reqwest::Client,
+            _account: &gateway_core::AccountView<'_>,
+        ) -> Result<gateway_core::CheckinOutcome, ProviderError> {
+            Ok(gateway_core::CheckinOutcome {
+                status: "skipped".into(),
+                message: "test".into(),
+                reward: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn per_account_limit_does_not_poison_provider_when_next_account_succeeds() {
+        let dir = std::env::temp_dir().join(format!(
+            "apip-limit-test-{}-{}",
+            std::process::id(),
+            gateway_core::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut base = routing_state(&dir);
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider);
+        base.providers = vec![provider.clone()];
+        let state = Arc::new(base);
+        let accounts = vec![
+            Account::new("fake", "bad", "bad"),
+            Account::new("fake", "good", "good"),
+        ];
+        let result = open_stream(
+            &state,
+            provider.clone(),
+            accounts,
+            &serde_json::json!({}),
+            "m",
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(state.model_limits.lock().await.is_empty());
+
+        let plan_then_good = vec![
+            Account::new("fake", "plan", "plan"),
+            Account::new("fake", "good2", "good"),
+        ];
+        let result = open_stream(
+            &state,
+            provider.clone(),
+            plan_then_good,
+            &serde_json::json!({}),
+            "m",
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(state.model_limits.lock().await.is_empty());
+
+        let all_bad = vec![
+            Account::new("fake", "bad", "bad"),
+            Account::new("fake", "bad2", "bad"),
+        ];
+        let result = open_stream(
+            &state,
+            provider.clone(),
+            all_bad,
+            &serde_json::json!({}),
+            "m",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(state
+            .model_limits
+            .lock()
+            .await
+            .contains_key(&limit_key("fake", "m")));
+
+        state.model_limits.lock().await.clear();
+        let all_plan = vec![
+            Account::new("fake", "plan", "plan"),
+            Account::new("fake", "plan2", "plan"),
+        ];
+        let result = open_stream(&state, provider, all_plan, &serde_json::json!({}), "m").await;
+        assert!(result.is_err());
+        assert!(state
+            .model_limits
+            .lock()
+            .await
+            .contains_key(&limit_key("fake", "m")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

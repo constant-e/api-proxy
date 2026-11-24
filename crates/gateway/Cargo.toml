@@ -13,6 +13,7 @@ gateway-core.workspace = true
 provider-workbuddy = { path = "../provider-workbuddy" }
 provider-qoder = { path = "../provider-qoder" }
 anyhow.workspace = true
+async-trait.workspace = true
 async-stream = "0.3"
 axum.workspace = true
 chrono.workspace = true

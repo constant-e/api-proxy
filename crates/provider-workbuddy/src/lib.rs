@@ -495,8 +495,25 @@ impl Provider for WorkBuddyProvider {
             .map_err(|e| ProviderError::Unavailable(e.to_string()))?;
         let status = resp.status().as_u16();
         if status >= 400 {
+            let retry_after_ms = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|s| s * 1000)
+                .unwrap_or(0);
             let text = resp.text().await.unwrap_or_default();
-            return Err(classify(status, &text));
+            let mut err = classify(status, &text);
+            if let ProviderError::RateLimited {
+                retry_after_ms: retry,
+                ..
+            } = &mut err
+            {
+                if retry_after_ms > 0 {
+                    *retry = retry_after_ms;
+                }
+            }
+            return Err(err);
         }
         let is_sse = resp
             .headers()
